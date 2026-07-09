@@ -1,0 +1,9 @@
+earthengine-api
+geemap
+geopandas
+shapely
+numpy
+pandas
+matplotlib
+scikit-image
+rasterio
