@@ -1,0 +1,20 @@
+{
+"type": "FeatureCollection",
+"name": "tidal_channels",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{"type":"Feature","properties":{"id":1,"Location Name":"Doria Nagar"},"geometry":{"type":"LineString","coordinates":[[91.996694865326717,21.396301151819213],[91.997816224004566,21.394532491295852]]}},
+{"type":"Feature","properties":{"id":2,"Location Name":"Himchari"},"geometry":{"type":"LineString","coordinates":[[92.004336802163337,21.384973509453626],[92.004496120882592,21.384752410936407]]}},
+{"type":"Feature","properties":{"id":3,"Location Name":"Himchari"},"geometry":{"type":"LineString","coordinates":[[92.024317514232976,21.354570755910508],[92.024510534989005,21.354117052788531]]}},
+{"type":"Feature","properties":{"id":4,"Location Name":"Kakra Beach"},"geometry":{"type":"LineString","coordinates":[[92.026682784449676,21.349624174668627],[92.027087208890862,21.348591178454974]]}},
+{"type":"Feature","properties":{"id":5,"Location Name":"Reju Canal"},"geometry":{"type":"LineString","coordinates":[[92.038276285096984,21.313339389653926],[92.03974691942858,21.304022735845873]]}},
+{"type":"Feature","properties":{"id":6,"Location Name":"Coconut Sea Beach"},"geometry":{"type":"LineString","coordinates":[[92.047476941133993,21.24203369374618],[92.047574983422791,21.241188415921833]]}},
+{"type":"Feature","properties":{"id":7,"Location Name":"Inani Canal"},"geometry":{"type":"LineString","coordinates":[[92.04742791998963,21.235636876248932],[92.047501451706211,21.234540251095154]]}},
+{"type":"Feature","properties":{"id":8,"Location Name":"Inani Beach"},"geometry":{"type":"LineString","coordinates":[[92.048481874593918,21.226658017849498],[92.048506385166093,21.225812651882059]]}},
+{"type":"Feature","properties":{"id":9,"Location Name":"Patuwartek"},"geometry":{"type":"LineString","coordinates":[[92.059313249637114,21.165537509973039],[92.059631887075611,21.164954652340903]]}},
+{"type":"Feature","properties":{"id":10,"Location Name":"Patuwartek"},"geometry":{"type":"LineString","coordinates":[[92.061464052347034,21.162234619704751],[92.061733668641139,21.161788895304067]]}},
+{"type":"Feature","properties":{"id":11,"Location Name":"BaillaKhali"},"geometry":{"type":"LineString","coordinates":[[92.065226425178693,21.157937323419791],[92.066182337494212,21.156360092956227]]}},
+{"type":"Feature","properties":{"id":12,"Location Name":"Imamer Dail"},"geometry":{"type":"LineString","coordinates":[[92.080637447445142,21.139798158814397],[92.081715912621647,21.137580616452031]]}},
+{"type":"Feature","properties":{"id":13,"Location Name":"Chapatkhali"},"geometry":{"type":"LineString","coordinates":[[92.108959413614301,21.105411091507168],[92.11105506753681,21.102735699588884]]}}
+]
+}
