@@ -40,6 +40,24 @@ dominated, cyclone-affected. Target period: 1988–2025.
   relative SLR, GBM sediment flux; Kamphuis longshore transport; Random Forest
   importance, GAM, wavelet coherence. Pre/post-monsoon & pre/post-cyclone windows.
 
+## Temporal design (locked)
+- Annual shoreline is derived from the DRY SEASON ONLY (Nov–Mar); monsoon
+  months are excluded from the trend layer.
+- One BEST (clearest) image per dry-season-year — a single scene, not a
+  composite — is selected for the annual shoreline.
+- Cloud threshold: ≤10% cloud cover computed OVER THE AOI (per-pixel cloud
+  mask reduced over the AOI polygon), NOT scene-wide metadata such as
+  CLOUDY_PIXEL_PERCENTAGE / CLOUD_COVER.
+- Dry-season-year labelling: a scene acquired in Nov or Dec belongs to the NEXT
+  calendar year; a scene acquired in Jan–Mar belongs to the SAME calendar year.
+  (Dry-season-year Y spans (Y-1)-11-01 to Y-03-31.)
+- All candidate scenes are logged (sensor, date, AOI cloud %); dry-season-years
+  with no ≤10% image are flagged as GAPS.
+- Both Sentinel-2 (10 m) and Landsat (30 m) are used; the sensor of the chosen
+  image is tracked per year to feed the per-sensor uncertainty budget.
+- Landsat 7 SLC-off (after 2003-05) scenes are flagged and used ONLY to fill
+  gaps (years with no other ≤10% image).
+
 ## Conventions
 - CRS: EPSG:4326 for storage; EPSG:32646 (UTM 46N) for all metric operations.
 - Every function: docstring + type hints. Validate units at stage boundaries.
