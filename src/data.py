@@ -840,3 +840,24 @@ def candidate_mosaic_truecolor(
         rgb = reflectance.visualize(min=0.0, max=0.3)
 
     return rgb.clip(aoi)
+
+
+def tidal_channels_fc() -> ee.FeatureCollection:
+    """Load the tidal-channel reference lines as an ``ee.FeatureCollection``.
+
+    Reads ``data/tidal_channels.geojson`` (LineString features) via
+    :func:`config.load_tidal_channels` and builds the collection directly with
+    ``ee.Geometry`` / ``ee.Feature`` — no dependency on ``geemap`` GeoJSON
+    helpers, whose names differ across versions.
+
+    Returns:
+        An ``ee.FeatureCollection`` of the tidal-channel lines (EPSG:4326).
+    """
+    geojson = config.load_tidal_channels()
+    features = [
+        ee.Feature(
+            ee.Geometry(feature["geometry"]), feature.get("properties") or {}
+        )
+        for feature in geojson["features"]
+    ]
+    return ee.FeatureCollection(features)

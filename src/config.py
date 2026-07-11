@@ -63,6 +63,27 @@ def aoi_coordinates() -> list:
     return ring
 
 
+# Path to reference tidal-channel lines (LineString FeatureCollection in
+# EPSG:4326) used as a review overlay.  <-- TUNABLE
+TIDAL_CHANNELS_PATH: str = "data/tidal_channels.geojson"
+
+
+def load_tidal_channels() -> dict:
+    """Read the tidal-channel GeoJSON file and return it as a parsed dictionary.
+
+    Returns:
+        The GeoJSON ``FeatureCollection`` (LineString features) as a Python dict.
+
+    Raises:
+        FileNotFoundError: If the file does not exist at ``TIDAL_CHANNELS_PATH``.
+        json.JSONDecodeError: If the file is not valid JSON.
+    """
+    channels_file: Path = _PROJECT_ROOT / TIDAL_CHANNELS_PATH
+    with open(channels_file, "r", encoding="utf-8") as f:
+        channels: Dict[str, Any] = json.load(f)
+    return channels
+
+
 # ---------------------------------------------------------------------------
 # Coordinate reference systems
 # ---------------------------------------------------------------------------
