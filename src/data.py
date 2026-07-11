@@ -475,9 +475,11 @@ def candidates_by_date(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
         )
 
         # Server-side mirror of slc_off(): L7 acquired after the SLC-off date.
-        is_slc_off = sensor.equals("L7").And(
-            ee.Date(date).millis().gt(slc_off_millis)
-        )
+        # Use compareTo(...).eq(0) so the result is a typed ee.Number (which
+        # has .And); ee.String.equals returns an untyped ComputedObject.
+        is_l7 = sensor.compareTo("L7").eq(0)
+        is_after_slc = ee.Date(date).millis().gt(slc_off_millis)
+        is_slc_off = is_l7.And(is_after_slc)
 
         properties = {
             "dry_year": year,
