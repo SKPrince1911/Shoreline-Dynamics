@@ -97,6 +97,19 @@ LANDSAT9_C2_L2: str = "LANDSAT/LC09/C02/T1_L2"
 CS_THRESHOLD: float = 0.55
 
 # ---------------------------------------------------------------------------
+# Scene selection thresholds (per dry-season-year)
+# ---------------------------------------------------------------------------
+# A candidate is eligible for the annual shoreline only if its AOI cloud cover
+# is at or below this percentage.  <-- TUNABLE
+CLOUD_THRESHOLD_PCT: float = 10.0
+# ...and it covers at least this percentage of the AOI (valid data pixels).
+# <-- TUNABLE
+COVERAGE_THRESHOLD_PCT: float = 95.0
+# Landsat 7 lost its Scan Line Corrector after this date; later ETM+ scenes
+# have ~22% striping gaps and are used only to fill otherwise-empty years.
+SLC_OFF_DATE: str = "2003-05-31"
+
+# ---------------------------------------------------------------------------
 # Seasonal windows (calendar month numbers, 1 = January)
 # ---------------------------------------------------------------------------
 # Dry season used for the annual median trend composites (spans the new year).

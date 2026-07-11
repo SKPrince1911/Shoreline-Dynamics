@@ -4,8 +4,9 @@ Builds the per-year candidate-scene inventory for the dry-season shoreline
 pipeline. For each dry-season-year it retrieves Sentinel-2 SR Harmonized and
 Landsat 5/7/8/9 Collection 2 L2 imagery, computes an AOI-based cloud percentage
 (Cloud Score+ for Sentinel-2, QA_PIXEL bit flags for Landsat) rather than
-relying on scene-wide metadata, and returns a tidy table of candidates from
-which the single clearest image per year is later chosen.
+relying on scene-wide metadata, mosaics same-day scenes to measure AOI
+coverage, and selects the single clearest full-coverage image per year (flagging
+gap years when none qualifies).
 
 Execution model: this module uses the Google Earth Engine Python API. It assumes
 ``ee.Initialize(...)`` has ALREADY been called by the caller (e.g. the Colab
@@ -46,6 +47,22 @@ _LANDSAT_COLLECTIONS: Dict[str, str] = {
 _QA_DILATED_CLOUD_BIT: int = 1  # Dilated cloud.
 _QA_CLOUD_BIT: int = 3          # Cloud.
 _QA_CLOUD_SHADOW_BIT: int = 4   # Cloud shadow.
+_QA_FILL_BIT: int = 0           # Fill / no-data (incl. Landsat 7 SLC-off gaps).
+
+# Common AOI analysis scale (m) for the per-date coverage/cloud reductions.
+# Uses the coarser Landsat pixel so metrics are comparable across sensors.
+# <-- TUNABLE
+_AOI_ANALYSIS_SCALE: int = 30
+
+# Sensor selection preference (lower rank = preferred) used to break ties
+# between equally-clean candidates: finer/better sensors first.
+_RESOLUTION_RANK: Dict[str, int] = {
+    "S2": 0,   # 10 m Sentinel-2.
+    "L8": 1,   # 30 m Landsat 8 OLI.
+    "L9": 1,   # 30 m Landsat 9 OLI-2.
+    "L5": 2,   # 30 m Landsat 5 TM.
+    "L7": 3,   # 30 m Landsat 7 ETM+ (SLC-off risk).
+}
 
 
 def dry_season_month_filter() -> ee.Filter:
@@ -240,3 +257,312 @@ def list_scenes(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
     # list of images to build null-geometry features instead.
     images: ee.List = merged.toList(merged.size())
     return ee.FeatureCollection(images.map(_to_feature))
+
+
+def clean_scene_id(system_index: ee.String) -> ee.String:
+    """Strip merge-index prefixes from a ``system:index`` value.
+
+    ``ee.ImageCollection.merge`` prepends running numeric prefixes (e.g.
+    ``"1_1_2_"``) to each image's ``system:index`` to keep IDs unique. This
+    removes those leading ``<digits>_`` groups, returning the original scene ID.
+    Genuine scene IDs never begin with digits immediately followed by an
+    underscore (Landsat IDs start with letters; Sentinel-2 IDs start with a
+    date followed by ``T``), so the strip is unambiguous.
+
+    Args:
+        system_index: The (possibly prefixed) ``system:index`` string.
+
+    Returns:
+        The clean scene ID as an ``ee.String``.
+    """
+    return ee.String(system_index).replace("^([0-9]+_)+", "")
+
+
+def slc_off(sensor: str, date: str) -> bool:
+    """Return whether a scene is a Landsat 7 SLC-off acquisition.
+
+    Landsat 7 lost its Scan Line Corrector on 2003-05-31; later ETM+ scenes
+    carry ~22% striping gaps. Such scenes are usable only to fill otherwise
+    empty dry-season-years.
+
+    Args:
+        sensor: Sensor label (e.g. ``"L7"``).
+        date: Acquisition date as an ISO-8601 ``YYYY-MM-DD`` string. ISO dates
+            sort lexicographically, so a plain string comparison is correct.
+
+    Returns:
+        ``True`` if ``sensor`` is Landsat 7 and ``date`` is after
+        ``config.SLC_OFF_DATE``, else ``False``.
+    """
+    return sensor == "L7" and date > config.SLC_OFF_DATE
+
+
+def _prepare_landsat(
+    collection_id: str,
+    sensor_label: str,
+    aoi: ee.Geometry,
+    start: str,
+    end: str,
+) -> ee.ImageCollection:
+    """Prepare a Landsat collection for per-date mosaicking.
+
+    Each returned image carries a ``cloudy`` band (1 where dilated-cloud,
+    cloud, or cloud-shadow is flagged, masked to valid data) and a ``valid``
+    band (1 over non-fill data, masked elsewhere — so Landsat 7 SLC-off gaps
+    reduce coverage), plus the ``sensor``, ``date``, and ``sensor_date``
+    grouping properties.
+    """
+    collection: ee.ImageCollection = (
+        ee.ImageCollection(collection_id)
+        .filterBounds(aoi)
+        .filterDate(start, end)
+        .filter(dry_season_month_filter())
+    )
+
+    def _prepare(image: ee.Image) -> ee.Image:
+        qa: ee.Image = image.select("QA_PIXEL")
+        data_mask: ee.Image = qa.bitwiseAnd(1 << _QA_FILL_BIT).eq(0)  # not fill
+        dilated: ee.Image = qa.bitwiseAnd(1 << _QA_DILATED_CLOUD_BIT).neq(0)
+        cloud: ee.Image = qa.bitwiseAnd(1 << _QA_CLOUD_BIT).neq(0)
+        shadow: ee.Image = qa.bitwiseAnd(1 << _QA_CLOUD_SHADOW_BIT).neq(0)
+        cloudy: ee.Image = (
+            dilated.Or(cloud).Or(shadow).updateMask(data_mask).rename("cloudy")
+        )
+        valid: ee.Image = data_mask.selfMask().rename("valid")
+        return _tag_prepared(ee.Image.cat([cloudy, valid]), image, sensor_label)
+
+    return collection.map(_prepare)
+
+
+def _prepare_s2(aoi: ee.Geometry, start: str, end: str) -> ee.ImageCollection:
+    """Prepare Sentinel-2 SR Harmonized for per-date mosaicking.
+
+    Each returned image carries a ``cloudy`` band (Cloud Score+ ``cs`` below
+    ``CS_THRESHOLD``, masked to valid data) and a ``valid`` band (1 over data,
+    masked elsewhere), plus the ``sensor``, ``date``, and ``sensor_date``
+    grouping properties.
+    """
+    collection: ee.ImageCollection = (
+        ee.ImageCollection(config.S2_SR_HARMONIZED)
+        .filterBounds(aoi)
+        .filterDate(start, end)
+        .filter(dry_season_month_filter())
+        .linkCollection(ee.ImageCollection(config.CLOUD_SCORE_PLUS), ["cs"])
+    )
+
+    def _prepare(image: ee.Image) -> ee.Image:
+        # Data footprint from a reflectance band (masked over no-data).
+        data_mask: ee.Image = image.select("B8").mask()
+        cloudy: ee.Image = (
+            image.select("cs")
+            .lt(config.CS_THRESHOLD)
+            .updateMask(data_mask)
+            .rename("cloudy")
+        )
+        valid: ee.Image = data_mask.selfMask().rename("valid")
+        return _tag_prepared(ee.Image.cat([cloudy, valid]), image, "S2")
+
+    return collection.map(_prepare)
+
+
+def _tag_prepared(
+    prepared: ee.Image, source: ee.Image, sensor_label: str
+) -> ee.Image:
+    """Attach grouping properties to a prepared (cloudy+valid) image.
+
+    Carries the source ``system:time_start`` and ``system:index`` (so the
+    original scene ID survives merging) and sets ``sensor``, ``date``
+    (``YYYY-MM-DD``), and a ``sensor_date`` key used to group same-day scenes.
+    """
+    date: ee.Date = source.date()
+    date_str: ee.String = date.format("YYYY-MM-dd")
+    return prepared.set(
+        {
+            "sensor": sensor_label,
+            "date": date_str,
+            "sensor_date": ee.String(sensor_label).cat("_").cat(date_str),
+            "system:time_start": source.get("system:time_start"),
+            "system:index": source.get("system:index"),
+        }
+    )
+
+
+def candidates_by_date(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
+    """Group candidate scenes by sensor-date and mosaic each group.
+
+    For a dry-season-year, every operational sensor's scenes are grouped by
+    ``(sensor, acquisition-date)`` and mosaicked. For each mosaic the AOI cloud
+    percentage (mean of the cloudy mask over observed pixels) and AOI coverage
+    percentage (valid AOI pixels / total AOI pixels) are computed.
+
+    Args:
+        year: The dry-season-year label (e.g. 2010).
+        aoi: Area of interest as an ``ee.Geometry``.
+
+    Returns:
+        An ``ee.FeatureCollection`` of null-geometry features, one per
+        sensor-date, with properties: ``dry_year``, ``date`` (``YYYY-MM-DD``),
+        ``timestamp_utc`` (ISO-8601, earliest scene in the group), ``sensor``,
+        ``n_scenes``, ``slc_off``, ``image_ids`` (comma-joined clean IDs),
+        ``aoi_cloud_pct``, and ``aoi_coverage_pct``.
+    """
+    start, end = dry_season_window(year)
+    prepared: List[ee.ImageCollection] = []
+
+    for label, collection_id in _LANDSAT_COLLECTIONS.items():
+        first, last = _SENSOR_OPERATIONAL[label]
+        if first <= year <= last:
+            prepared.append(_prepare_landsat(collection_id, label, aoi, start, end))
+
+    s2_first, s2_last = _SENSOR_OPERATIONAL["S2"]
+    if s2_first <= year <= s2_last:
+        prepared.append(_prepare_s2(aoi, start, end))
+
+    if not prepared:
+        return ee.FeatureCollection([])
+
+    merged: ee.ImageCollection = reduce(
+        lambda acc, col: acc.merge(col), prepared
+    )
+
+    # Distinct sensor-date groups present this year.
+    keys: ee.List = merged.aggregate_array("sensor_date").distinct()
+
+    slc_off_millis: ee.Number = ee.Date(config.SLC_OFF_DATE).millis()
+
+    def _feature_for_key(key: ee.String) -> ee.Feature:
+        key = ee.String(key)
+        group: ee.ImageCollection = merged.filter(
+            ee.Filter.eq("sensor_date", key)
+        )
+        mosaic: ee.Image = group.mosaic()
+
+        aoi_cloud_pct = ee.Number(
+            mosaic.select("cloudy")
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=aoi,
+                scale=_AOI_ANALYSIS_SCALE,
+                maxPixels=1e9,
+                bestEffort=True,
+            )
+            .get("cloudy")
+        ).multiply(100)
+
+        aoi_coverage_pct = ee.Number(
+            mosaic.select("valid")
+            .unmask(0)
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=aoi,
+                scale=_AOI_ANALYSIS_SCALE,
+                maxPixels=1e9,
+                bestEffort=True,
+            )
+            .get("valid")
+        ).multiply(100)
+
+        sensor: ee.String = ee.String(group.first().get("sensor"))
+        date: ee.String = ee.String(group.first().get("date"))
+        timestamp_utc: ee.String = ee.Date(
+            group.aggregate_min("system:time_start")
+        ).format()
+        # Clean the merge-prefixed system:index of every scene in the group.
+        image_ids: ee.String = (
+            group.aggregate_array("system:index")
+            .map(lambda idx: clean_scene_id(ee.String(idx)))
+            .join(",")
+        )
+
+        # Server-side mirror of slc_off(): L7 acquired after the SLC-off date.
+        is_slc_off = sensor.equals("L7").And(
+            ee.Date(date).millis().gt(slc_off_millis)
+        )
+
+        properties = {
+            "dry_year": year,
+            "date": date,
+            "timestamp_utc": timestamp_utc,
+            "sensor": sensor,
+            "n_scenes": group.size(),
+            "slc_off": is_slc_off,
+            "image_ids": image_ids,
+            "aoi_cloud_pct": aoi_cloud_pct,
+            "aoi_coverage_pct": aoi_coverage_pct,
+        }
+        return ee.Feature(None, properties)
+
+    return ee.FeatureCollection(keys.map(_feature_for_key))
+
+
+def select_best(year: int, aoi: ee.Geometry) -> ee.Feature:
+    """Select the single best candidate scene for a dry-season-year.
+
+    Keeps only sensor-dates whose AOI coverage is at least
+    ``COVERAGE_THRESHOLD_PCT`` and AOI cloud is at most ``CLOUD_THRESHOLD_PCT``,
+    then returns the one with the lowest AOI cloud percentage. Ties are broken
+    by preferring non-SLC-off scenes, then finer/preferred sensors
+    (S2 > L8/L9 > L5 > L7).
+
+    If nothing qualifies, returns the best available row flagged
+    ``selected = False`` with a ``gap_reason`` of ``"no ≥95% coverage"`` (when
+    no candidate meets coverage) or ``"no ≤10% cloud"`` (when coverage is met
+    but cloud is not). The candidate table is materialized client-side (a GEE
+    round-trip) so the multi-key tie-break and gap logic stay unambiguous.
+
+    Args:
+        year: The dry-season-year label (e.g. 2010).
+        aoi: Area of interest as an ``ee.Geometry``.
+
+    Returns:
+        An ``ee.Feature`` (null geometry) carrying the chosen (or best-available)
+        candidate's properties plus ``selected`` and, when unselected,
+        ``gap_reason``.
+    """
+    candidates = candidates_by_date(year, aoi)
+    rows: List[dict] = [
+        feature["properties"]
+        for feature in candidates.getInfo().get("features", [])
+    ]
+
+    def _rank_key(row: dict) -> tuple:
+        # Lowest cloud first; then non-SLC-off; then preferred sensor.
+        return (
+            row["aoi_cloud_pct"],
+            slc_off(row["sensor"], row["date"]),
+            _RESOLUTION_RANK.get(row["sensor"], 99),
+        )
+
+    qualified = [
+        row
+        for row in rows
+        if row["aoi_coverage_pct"] >= config.COVERAGE_THRESHOLD_PCT
+        and row["aoi_cloud_pct"] <= config.CLOUD_THRESHOLD_PCT
+    ]
+
+    if qualified:
+        best = min(qualified, key=_rank_key)
+        return ee.Feature(None, {**best, "selected": True})
+
+    # No qualifying scene -> record the gap with the best available row.
+    if not rows:
+        return ee.Feature(
+            None,
+            {"dry_year": year, "selected": False, "gap_reason": "no ≥95% coverage"},
+        )
+
+    covered = [
+        row
+        for row in rows
+        if row["aoi_coverage_pct"] >= config.COVERAGE_THRESHOLD_PCT
+    ]
+    if not covered:
+        gap_reason = "no ≥95% coverage"
+        best_available = max(rows, key=lambda row: row["aoi_coverage_pct"])
+    else:
+        gap_reason = "no ≤10% cloud"
+        best_available = min(covered, key=lambda row: row["aoi_cloud_pct"])
+
+    return ee.Feature(
+        None, {**best_available, "selected": False, "gap_reason": gap_reason}
+    )
