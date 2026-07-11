@@ -506,8 +506,13 @@ def _candidates_fc(
             bestEffort=True,
         )
         aoi_cloud_pct = ee.Number(stats.get("cloudy_mean")).multiply(100)
+        # Clamp to 100: Sentinel-2 mosaics can report ~100.5 because the coarse
+        # screening grid overcounts valid pixels near the AOI edge.
         aoi_coverage_pct = (
-            ee.Number(stats.get("valid_count")).divide(total_aoi_px).multiply(100)
+            ee.Number(stats.get("valid_count"))
+            .divide(total_aoi_px)
+            .multiply(100)
+            .min(100.0)
         )
 
         timestamp_utc: ee.String = ee.Date(
@@ -606,73 +611,232 @@ def candidates_dataframe(
     return df
 
 
+def _rank_key(row: dict) -> tuple:
+    """Sort key for a qualifying candidate: clearest, then most reliable sensor.
+
+    Lowest AOI cloud first; ties broken by preferring non-SLC-off scenes, then
+    finer/preferred sensors (S2 > L8/L9 > L5 > L7).
+    """
+    return (
+        row["aoi_cloud_pct"],
+        slc_off(row["sensor"], row["date"]),
+        _RESOLUTION_RANK.get(row["sensor"], 99),
+    )
+
+
+def _cloud_ok(row: dict) -> bool:
+    """Whether a candidate's AOI cloud cover is within the threshold."""
+    return row["aoi_cloud_pct"] <= config.CLOUD_THRESHOLD_PCT
+
+
+def _classify_candidates(rows: List[dict]):
+    """Partition candidates into the two qualifying tiers and the remainder.
+
+    Returns:
+        A ``(tier1, tier2, rest)`` tuple of disjoint lists, each already sorted:
+        ``tier1`` (coverage >= strict threshold and cloud OK) and ``tier2``
+        (relaxed <= coverage < strict, cloud OK) by :func:`_rank_key`; ``rest``
+        (everything else) by coverage descending then cloud ascending.
+    """
+    tier1 = sorted(
+        [
+            row
+            for row in rows
+            if row["aoi_coverage_pct"] >= config.COVERAGE_THRESHOLD_PCT
+            and _cloud_ok(row)
+        ],
+        key=_rank_key,
+    )
+    tier2 = sorted(
+        [
+            row
+            for row in rows
+            if config.COVERAGE_THRESHOLD_RELAXED_PCT
+            <= row["aoi_coverage_pct"]
+            < config.COVERAGE_THRESHOLD_PCT
+            and _cloud_ok(row)
+        ],
+        key=_rank_key,
+    )
+    used = {(row["sensor"], row["date"]) for row in tier1 + tier2}
+    rest = sorted(
+        [row for row in rows if (row["sensor"], row["date"]) not in used],
+        key=lambda row: (-row["aoi_coverage_pct"], row["aoi_cloud_pct"]),
+    )
+    return tier1, tier2, rest
+
+
 def select_best(year: int, aoi: ee.Geometry) -> ee.Feature:
     """Select the single best candidate scene for a dry-season-year.
 
-    Keeps only sensor-dates whose AOI coverage is at least
-    ``COVERAGE_THRESHOLD_PCT`` and AOI cloud is at most ``CLOUD_THRESHOLD_PCT``,
-    then returns the one with the lowest AOI cloud percentage. Ties are broken
-    by preferring non-SLC-off scenes, then finer/preferred sensors
-    (S2 > L8/L9 > L5 > L7).
+    Two-tier adaptive rule:
 
-    If nothing qualifies, returns the best available row flagged
-    ``selected = False`` with a ``gap_reason`` of ``"no ≥95% coverage"`` (when
-    no candidate meets coverage) or ``"no ≤10% cloud"`` (when coverage is met
-    but cloud is not). The candidate table is materialized client-side (paged
-    over sensor-date keys, via ``_materialize_candidates``) so the multi-key
-    tie-break and gap logic stay unambiguous.
+    1. If any candidate has coverage >= ``COVERAGE_THRESHOLD_PCT`` and cloud
+       <= ``CLOUD_THRESHOLD_PCT``, pick the lowest-cloud one (tie-break:
+       non-SLC-off preferred, then S2 > L8/L9 > L5 > L7) with
+       ``relaxed_coverage=False``.
+    2. Otherwise, if any candidate has coverage >= ``COVERAGE_THRESHOLD_RELAXED_PCT``
+       and cloud <= ``CLOUD_THRESHOLD_PCT``, pick it the same way with
+       ``relaxed_coverage=True``.
+    3. Otherwise return a gap feature (``selected=False``) with a ``gap_reason``,
+       keeping the best-available row: highest coverage among cloud-OK
+       candidates, or the lowest-cloud candidate if none are cloud-OK.
+
+    Every returned feature carries ``relaxed_coverage``. The candidate table is
+    materialized client-side (paged over sensor-date keys, via
+    :func:`_materialize_candidates`) so the tiering and tie-breaks stay
+    unambiguous.
 
     Args:
         year: The dry-season-year label (e.g. 2010).
         aoi: Area of interest as an ``ee.Geometry``.
 
     Returns:
-        An ``ee.Feature`` (null geometry) carrying the chosen (or best-available)
-        candidate's properties plus ``selected`` and, when unselected,
-        ``gap_reason``.
+        An ``ee.Feature`` (null geometry) with the chosen (or best-available)
+        candidate's properties plus ``selected`` and ``relaxed_coverage`` (and,
+        when unselected, ``gap_reason``).
     """
-    # Key-paged materialization avoids the "Too many concurrent aggregations"
-    # (HTTP 429) limit that a single getInfo over the whole collection can hit.
     rows: List[dict] = _materialize_candidates(year, aoi)
+    tier1, tier2, _rest = _classify_candidates(rows)
 
-    def _rank_key(row: dict) -> tuple:
-        # Lowest cloud first; then non-SLC-off; then preferred sensor.
-        return (
-            row["aoi_cloud_pct"],
-            slc_off(row["sensor"], row["date"]),
-            _RESOLUTION_RANK.get(row["sensor"], 99),
+    if tier1:
+        return ee.Feature(
+            None, {**tier1[0], "selected": True, "relaxed_coverage": False}
+        )
+    if tier2:
+        return ee.Feature(
+            None, {**tier2[0], "selected": True, "relaxed_coverage": True}
         )
 
-    qualified = [
-        row
-        for row in rows
-        if row["aoi_coverage_pct"] >= config.COVERAGE_THRESHOLD_PCT
-        and row["aoi_cloud_pct"] <= config.CLOUD_THRESHOLD_PCT
-    ]
-
-    if qualified:
-        best = min(qualified, key=_rank_key)
-        return ee.Feature(None, {**best, "selected": True})
-
-    # No qualifying scene -> record the gap with the best available row.
+    # Gap year: no qualifying scene at either coverage tier.
     if not rows:
         return ee.Feature(
             None,
-            {"dry_year": year, "selected": False, "gap_reason": "no ≥95% coverage"},
+            {
+                "dry_year": year,
+                "selected": False,
+                "relaxed_coverage": False,
+                "gap_reason": "no candidate scenes",
+            },
         )
 
-    covered = [
-        row
-        for row in rows
-        if row["aoi_coverage_pct"] >= config.COVERAGE_THRESHOLD_PCT
-    ]
-    if not covered:
-        gap_reason = "no ≥95% coverage"
-        best_available = max(rows, key=lambda row: row["aoi_coverage_pct"])
+    cloud_ok = [row for row in rows if _cloud_ok(row)]
+    if cloud_ok:
+        best_available = max(cloud_ok, key=lambda row: row["aoi_coverage_pct"])
+        gap_reason = "no >=90% coverage"
     else:
-        gap_reason = "no ≤10% cloud"
-        best_available = min(covered, key=lambda row: row["aoi_cloud_pct"])
+        best_available = min(rows, key=lambda row: row["aoi_cloud_pct"])
+        gap_reason = "no <=10% cloud"
 
     return ee.Feature(
-        None, {**best_available, "selected": False, "gap_reason": gap_reason}
+        None,
+        {
+            **best_available,
+            "selected": False,
+            "relaxed_coverage": False,
+            "gap_reason": gap_reason,
+        },
     )
+
+
+def _ranked_rows(year: int, aoi: ee.Geometry) -> List[dict]:
+    """Return all candidate rows for the year, ranked (rank 0 = select_best pick).
+
+    Order: tier-1 qualifying (strict coverage) then tier-2 relaxed coverage —
+    both cloud-OK, by :func:`_rank_key` — then the remainder by coverage
+    descending, cloud ascending. Each row gains ``rank`` (0-based) and the
+    booleans ``qualifies_95`` and ``qualifies_90``.
+    """
+    rows = _materialize_candidates(year, aoi)
+    tier1, tier2, rest = _classify_candidates(rows)
+    ranked: List[dict] = []
+    for index, row in enumerate(tier1 + tier2 + rest):
+        ranked.append(
+            {
+                **row,
+                "rank": index,
+                "qualifies_95": bool(
+                    row["aoi_coverage_pct"] >= config.COVERAGE_THRESHOLD_PCT
+                    and _cloud_ok(row)
+                ),
+                "qualifies_90": bool(
+                    row["aoi_coverage_pct"] >= config.COVERAGE_THRESHOLD_RELAXED_PCT
+                    and _cloud_ok(row)
+                ),
+            }
+        )
+    return ranked
+
+
+def year_candidates_ranked(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
+    """Return all candidate sensor-dates for the year, ranked and flagged.
+
+    Rank 0 is the :func:`select_best` pick. Each null-geometry feature carries
+    the candidate properties plus ``rank`` (0-based), ``qualifies_95``, and
+    ``qualifies_90``. Features are built from already-materialized scalars, so
+    fetching this collection is cheap (no per-feature reductions).
+
+    Args:
+        year: The dry-season-year label.
+        aoi: Area of interest as an ``ee.Geometry``.
+
+    Returns:
+        An ``ee.FeatureCollection`` ordered by ``rank`` ascending.
+    """
+    ranked = _ranked_rows(year, aoi)
+    return ee.FeatureCollection([ee.Feature(None, row) for row in ranked])
+
+
+def candidate_mosaic_truecolor(
+    year: int, aoi: ee.Geometry, rank: int = 0
+) -> ee.Image:
+    """Rebuild a true-color RGB mosaic for the rank-th ranked candidate.
+
+    Reloads the raw imagery for that candidate's sensor and acquisition date,
+    mosaics it, and returns a visualized RGB image clipped to the AOI, with
+    the correct bands and scaling per sensor:
+
+    * Sentinel-2: ``B4, B3, B2`` (display min 0, max 3000).
+    * Landsat 8/9 C2 L2: ``SR_B4, SR_B3, SR_B2``; Landsat 5/7 C2 L2:
+      ``SR_B3, SR_B2, SR_B1`` — scaled to reflectance (DN * 0.0000275 - 0.2,
+      display min 0.0, max 0.3).
+
+    Args:
+        year: The dry-season-year label.
+        aoi: Area of interest as an ``ee.Geometry``.
+        rank: 0-based rank from :func:`year_candidates_ranked` (0 = best).
+
+    Returns:
+        A visualized 3-band RGB ``ee.Image`` clipped to the AOI.
+    """
+    ranked = _ranked_rows(year, aoi)
+    row = ranked[rank]
+    sensor: str = row["sensor"]
+    day_start: ee.Date = ee.Date(row["date"])
+    day_end: ee.Date = day_start.advance(1, "day")
+
+    if sensor == "S2":
+        mosaic = (
+            ee.ImageCollection(config.S2_SR_HARMONIZED)
+            .filterBounds(aoi)
+            .filterDate(day_start, day_end)
+            .mosaic()
+        )
+        rgb = mosaic.select(["B4", "B3", "B2"]).visualize(min=0, max=3000)
+    else:
+        bands = (
+            ["SR_B4", "SR_B3", "SR_B2"]
+            if sensor in ("L8", "L9")
+            else ["SR_B3", "SR_B2", "SR_B1"]
+        )
+        mosaic = (
+            ee.ImageCollection(_LANDSAT_COLLECTIONS[sensor])
+            .filterBounds(aoi)
+            .filterDate(day_start, day_end)
+            .mosaic()
+        )
+        # Collection 2 Level 2 surface-reflectance scaling.
+        reflectance = mosaic.select(bands).multiply(0.0000275).add(-0.2)
+        rgb = reflectance.visualize(min=0.0, max=0.3)
+
+    return rgb.clip(aoi)

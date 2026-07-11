@@ -105,6 +105,10 @@ CLOUD_THRESHOLD_PCT: float = 10.0
 # ...and it covers at least this percentage of the AOI (valid data pixels).
 # <-- TUNABLE
 COVERAGE_THRESHOLD_PCT: float = 95.0
+# Relaxed AOI coverage floor: used only when no scene meets the strict
+# threshold, so a slightly-clipped but clear image can still be selected
+# (flagged relaxed_coverage=True).  <-- TUNABLE
+COVERAGE_THRESHOLD_RELAXED_PCT: float = 90.0
 # Landsat 7 lost its Scan Line Corrector after this date; later ETM+ scenes
 # have ~22% striping gaps and are used only to fill otherwise-empty years.
 SLC_OFF_DATE: str = "2003-05-31"
