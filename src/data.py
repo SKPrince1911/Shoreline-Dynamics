@@ -54,11 +54,12 @@ _QA_FILL_BIT: int = 0           # Fill / no-data (incl. Landsat 7 SLC-off gaps).
 # <-- TUNABLE
 _AOI_ANALYSIS_SCALE: int = 30
 
-# How many per-date features to materialize per Earth Engine request. Fetching
-# a whole aggregation-heavy FeatureCollection at once trips the "Too many
-# concurrent aggregations" limit (HTTP 429); paging keeps each request small.
-# Lower this if 429s persist.  <-- TUNABLE
-_MATERIALIZE_BATCH_SIZE: int = 5
+# How many sensor-date features to materialize per Earth Engine request.
+# Evaluating a whole aggregation-heavy FeatureCollection at once trips the "Too
+# many concurrent aggregations" limit (HTTP 429), so results are fetched in
+# chunks of this many keys — each request builds a FeatureCollection of only
+# this many features. Lower this if 429s persist.  <-- TUNABLE
+_MATERIALIZE_BATCH_SIZE: int = 8
 
 # Sensor selection preference (lower rank = preferred) used to break ties
 # between equally-clean candidates: finer/better sensors first.
@@ -412,6 +413,23 @@ def candidates_by_date(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
         ``n_scenes``, ``slc_off``, ``image_ids`` (comma-joined clean IDs),
         ``aoi_cloud_pct``, and ``aoi_coverage_pct``.
     """
+    merged, keys, total_aoi_px, slc_off_millis = _candidate_components(year, aoi)
+    if merged is None:
+        return ee.FeatureCollection([])
+    return _candidates_fc(keys, merged, aoi, year, total_aoi_px, slc_off_millis)
+
+
+def _candidate_components(year: int, aoi: ee.Geometry):
+    """Build the merged prepared collection and the shared reduction inputs.
+
+    Returns:
+        A ``(merged, keys, total_aoi_px, slc_off_millis)`` tuple, where
+        ``merged`` is the prepared+merged ``ee.ImageCollection`` (``None`` if no
+        sensor is operational this year), ``keys`` is the ``ee.List`` of distinct
+        ``sensor_date`` strings, ``total_aoi_px`` is the AOI pixel count at the
+        analysis scale (coverage denominator), and ``slc_off_millis`` is the
+        SLC-off cutoff in epoch milliseconds.
+    """
     start, end = dry_season_window(year)
     prepared: List[ee.ImageCollection] = []
 
@@ -425,17 +443,14 @@ def candidates_by_date(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
         prepared.append(_prepare_s2(aoi, start, end))
 
     if not prepared:
-        return ee.FeatureCollection([])
+        return None, None, None, None
 
     merged: ee.ImageCollection = reduce(
         lambda acc, col: acc.merge(col), prepared
     )
-
     # Distinct sensor-date groups present this year.
     keys: ee.List = merged.aggregate_array("sensor_date").distinct()
-
     slc_off_millis: ee.Number = ee.Date(config.SLC_OFF_DATE).millis()
-
     # Total AOI pixel count at the analysis scale, computed once and reused as
     # the coverage denominator (keeps per-feature work to a single reduceRegion).
     total_aoi_px: ee.Number = ee.Number(
@@ -449,6 +464,22 @@ def candidates_by_date(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
         )
         .get("constant")
     )
+    return merged, keys, total_aoi_px, slc_off_millis
+
+
+def _candidates_fc(
+    keys: ee.List,
+    merged: ee.ImageCollection,
+    aoi: ee.Geometry,
+    year: int,
+    total_aoi_px: ee.Number,
+    slc_off_millis: ee.Number,
+) -> ee.FeatureCollection:
+    """Build the null-geometry candidate features for a set of sensor-date keys.
+
+    The number of features (and thus concurrent reductions) equals ``len(keys)``,
+    so passing a small key subset bounds the aggregations evaluated per request.
+    """
 
     def _feature_for_key(key: ee.String) -> ee.Feature:
         key = ee.String(key)
@@ -509,32 +540,70 @@ def candidates_by_date(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
         }
         return ee.Feature(None, properties)
 
-    return ee.FeatureCollection(keys.map(_feature_for_key))
+    return ee.FeatureCollection(ee.List(keys).map(_feature_for_key))
 
 
-def features_to_records(
-    features: ee.FeatureCollection, batch_size: int = _MATERIALIZE_BATCH_SIZE
+def _materialize_candidates(
+    year: int, aoi: ee.Geometry, chunk: int = _MATERIALIZE_BATCH_SIZE
 ) -> List[dict]:
-    """Materialize a FeatureCollection's properties in small batches.
+    """Fetch per-date candidate properties by paging over sensor-date keys.
 
-    Fetching a whole aggregation-heavy FeatureCollection at once can exceed
-    Earth Engine's concurrent-aggregation limit (HTTP 429, "Too many concurrent
-    aggregations"). Paging through it with ``toList(batch_size, offset)`` bounds
-    how many per-feature reductions run per request.
+    Evaluating every sensor-date in one request runs all their reductions
+    concurrently and trips Earth Engine's HTTP 429 "Too many concurrent
+    aggregations" limit on high-sensor years (e.g. 2022: L7+L8+L9+S2). Instead,
+    the distinct keys are listed once (cheap), then a *small* FeatureCollection
+    of at most ``chunk`` features is built and evaluated per request, so each
+    ``getInfo`` runs only ~``chunk`` reductions.
 
     Args:
-        features: The FeatureCollection to materialize (null-geometry rows).
-        batch_size: Number of features to fetch per request.
+        year: The dry-season-year label.
+        aoi: Area of interest as an ``ee.Geometry``.
+        chunk: Number of sensor-dates to evaluate per request.
 
     Returns:
-        A list of per-feature property dictionaries, in collection order.
+        A list of per-sensor-date property dictionaries.
     """
-    total: int = features.size().getInfo()
+    merged, keys, total_aoi_px, slc_off_millis = _candidate_components(year, aoi)
+    if merged is None:
+        return []
+    key_list: List[str] = keys.getInfo()  # cheap: list of "sensor_date" strings
     records: List[dict] = []
-    for offset in range(0, total, batch_size):
-        page = features.toList(batch_size, offset).getInfo()
-        records.extend(feature.get("properties", {}) for feature in page)
+    for start in range(0, len(key_list), chunk):
+        subset = key_list[start:start + chunk]
+        fc = _candidates_fc(
+            ee.List(subset), merged, aoi, year, total_aoi_px, slc_off_millis
+        )
+        records.extend(
+            feature["properties"] for feature in fc.getInfo()["features"]
+        )
     return records
+
+
+def candidates_dataframe(
+    year: int, aoi: ee.Geometry, chunk: int = _MATERIALIZE_BATCH_SIZE
+):
+    """Return the per-date candidate inventory as a sorted pandas DataFrame.
+
+    Convenience wrapper over :func:`candidates_by_date` that retrieves results
+    in key chunks (see :func:`_materialize_candidates`) to avoid the "Too many
+    concurrent aggregations" (HTTP 429) limit, then sorts by AOI cloud %.
+
+    Args:
+        year: The dry-season-year label.
+        aoi: Area of interest as an ``ee.Geometry``.
+        chunk: Number of sensor-dates to evaluate per request.
+
+    Returns:
+        A ``pandas.DataFrame`` of candidates sorted by ``aoi_cloud_pct``
+        (ascending); empty if the year has no candidate scenes.
+    """
+    import pandas as pd
+
+    rows = _materialize_candidates(year, aoi, chunk)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("aoi_cloud_pct").reset_index(drop=True)
+    return df
 
 
 def select_best(year: int, aoi: ee.Geometry) -> ee.Feature:
@@ -549,9 +618,9 @@ def select_best(year: int, aoi: ee.Geometry) -> ee.Feature:
     If nothing qualifies, returns the best available row flagged
     ``selected = False`` with a ``gap_reason`` of ``"no ≥95% coverage"`` (when
     no candidate meets coverage) or ``"no ≤10% cloud"`` (when coverage is met
-    but cloud is not). The candidate table is materialized client-side (in
-    batches, via ``features_to_records``) so the multi-key tie-break and gap
-    logic stay unambiguous.
+    but cloud is not). The candidate table is materialized client-side (paged
+    over sensor-date keys, via ``_materialize_candidates``) so the multi-key
+    tie-break and gap logic stay unambiguous.
 
     Args:
         year: The dry-season-year label (e.g. 2010).
@@ -562,10 +631,9 @@ def select_best(year: int, aoi: ee.Geometry) -> ee.Feature:
         candidate's properties plus ``selected`` and, when unselected,
         ``gap_reason``.
     """
-    candidates = candidates_by_date(year, aoi)
-    # Batched materialization avoids the "Too many concurrent aggregations"
+    # Key-paged materialization avoids the "Too many concurrent aggregations"
     # (HTTP 429) limit that a single getInfo over the whole collection can hit.
-    rows: List[dict] = features_to_records(candidates)
+    rows: List[dict] = _materialize_candidates(year, aoi)
 
     def _rank_key(row: dict) -> tuple:
         # Lowest cloud first; then non-SLC-off; then preferred sensor.
