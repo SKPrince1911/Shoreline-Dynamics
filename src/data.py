@@ -106,6 +106,17 @@ def dry_season_window(year: int) -> Tuple[str, str]:
     return start, end
 
 
+def season_label(year: int) -> str:
+    """Return the human-readable dry-season label for a dry-season-year.
+
+    The dry season spans November of the previous calendar year through March of
+    the labelled year, so ``year`` maps to ``"(year-1)-(year)"`` (e.g. 1995 ->
+    ``"1994-1995"``). ``dry_year`` remains the integer key for sorting/joins;
+    ``season_label`` is the display field.
+    """
+    return f"{year - 1}-{year}"
+
+
 def s2_with_aoi_cloud(aoi: ee.Geometry, start: str, end: str) -> ee.ImageCollection:
     """Load Sentinel-2 SR Harmonized with an AOI-based cloud percentage.
 
@@ -601,6 +612,7 @@ def _candidates_fc(
 
         properties = {
             "dry_year": year,
+            "season_label": season_label(year),
             "date": date,
             "timestamp_utc": timestamp_utc,
             "sensor": sensor,
@@ -781,6 +793,7 @@ def select_best(year: int, aoi: ee.Geometry) -> ee.Feature:
             None,
             {
                 "dry_year": year,
+                "season_label": season_label(year),
                 "selected": False,
                 "relaxed_coverage": False,
                 "gap_reason": "no candidate scenes",
@@ -992,6 +1005,8 @@ def _empty_composite() -> ee.Image:
             "contributing_coverage_pct": ee.List([]),
             "contributing_marginal_gain_pct": ee.List([]),
             "contributing_cloud_pct": ee.List([]),
+            "contributing_sensors": ee.List([]),
+            "contributing_image_ids": ee.List([]),
             "n_dates": 0,
             "n_dates_available": 0,
             "achieved_coverage_pct": 0,
@@ -1097,15 +1112,20 @@ def season_fill_composite(
                 "coverage": _aoi_coverage_pct(clear.select("R"), aoi),
                 "cloud": cloud,
                 "time": group.aggregate_min("system:time_start"),
+                "image_ids": group.aggregate_array("system:index")
+                .map(lambda idx: clean_scene_id(ee.String(idx)))
+                .join(","),
             }
         ).getInfo()
         date_infos.append(
             {
                 "key": key,
+                "sensor": key.split("_", 1)[0],
                 "date": key.split("_", 1)[1],
                 "coverage": info["coverage"],
                 "cloud": info["cloud"],
                 "time": int(info["time"]),
+                "image_ids": info["image_ids"],
                 "clear": clear,
                 "valid_binary": clear.select("R").mask(),  # 0/1, unmasked
             }
@@ -1202,6 +1222,8 @@ def season_fill_composite(
                 entry["marginal_gain"] for entry in selected
             ],
             "contributing_cloud_pct": [entry["cloud"] for entry in selected],
+            "contributing_sensors": [entry["sensor"] for entry in selected],
+            "contributing_image_ids": [entry["image_ids"] for entry in selected],
             "n_dates": len(selected),
             "n_dates_available": len(date_infos),
             "achieved_coverage_pct": achieved_fine,
@@ -1222,16 +1244,20 @@ def product_recommendation(year: int, aoi: ee.Geometry) -> ee.Dictionary:
         aoi: Area of interest as an ``ee.Geometry``.
 
     Returns:
-        An ``ee.Dictionary``. For a single scene: ``product_type='single'``,
-        ``date``, ``sensor``, ``cloud``, ``coverage``. For a composite:
-        ``product_type`` (``'composite'``/``'partial'``), ``n_dates``,
-        ``achieved_coverage_pct``, ``contributing_dates``.
+        An ``ee.Dictionary`` carrying ``dry_year`` and ``season_label``. For a
+        single scene: ``product_type='single'``, ``date``, ``sensor``,
+        ``cloud``, ``coverage``. For a composite: ``product_type``
+        (``'composite'``/``'partial'``), ``n_dates``, ``achieved_coverage_pct``,
+        ``contributing_dates``.
     """
+    label = season_label(year)
     ranked = _ranked_rows(year, aoi)
     if ranked and ranked[0]["is_complete"]:
         top = ranked[0]
         return ee.Dictionary(
             {
+                "dry_year": year,
+                "season_label": label,
                 "product_type": "single",
                 "date": top["date"],
                 "sensor": top["sensor"],
@@ -1247,9 +1273,95 @@ def product_recommendation(year: int, aoi: ee.Geometry) -> ee.Dictionary:
     )
     return ee.Dictionary(
         {
+            "dry_year": year,
+            "season_label": label,
             "product_type": product_type,
             "n_dates": composite.get("n_dates"),
             "achieved_coverage_pct": achieved,
             "contributing_dates": composite.get("contributing_dates"),
         }
     )
+
+
+def year_product(
+    year: int, aoi: ee.Geometry, force_composite: bool = False
+) -> dict:
+    """Return the year's recommended product as a plain Python dict.
+
+    Uses the top-ranked full-coast single candidate when one exists (unless
+    ``force_composite``), otherwise the greedy gap-fill composite — labelled
+    ``'partial'`` when it cannot reach ``config.COVERAGE_COMPLETE_PCT`` (the
+    highest-coverage product achieved is kept either way).
+
+    Args:
+        year: The dry-season-year label.
+        aoi: Area of interest as an ``ee.Geometry``.
+        force_composite: If ``True``, always build the composite (skip the
+            single-scene shortcut).
+
+    Returns:
+        A dict with keys ``dry_year``, ``season_label``, ``product_type``
+        (``'single'``/``'composite'``/``'partial'``), ``sensor``, ``n_dates``,
+        ``dates`` (list), ``timestamps_utc`` (list), ``cloud_pct`` (the single
+        scene's, or the composite seed's), ``achieved_coverage_pct``,
+        ``image_ids`` (comma-joined), ``marginal_gains`` (list), and
+        ``n_dates_available``.
+    """
+    label = season_label(year)
+
+    if not force_composite:
+        ranked = _ranked_rows(year, aoi)
+        if ranked and ranked[0]["is_complete"]:
+            top = ranked[0]
+            return {
+                "dry_year": year,
+                "season_label": label,
+                "product_type": "single",
+                "sensor": top["sensor"],
+                "n_dates": 1,
+                "dates": [top["date"]],
+                "timestamps_utc": [top["timestamp_utc"]],
+                "cloud_pct": top["aoi_cloud_pct"],
+                "achieved_coverage_pct": top["aoi_coverage_pct"],
+                "image_ids": top["image_ids"],
+                "marginal_gains": [top["aoi_coverage_pct"]],
+                "n_dates_available": len(ranked),
+            }
+
+    composite = season_fill_composite(year, aoi)
+    meta = composite.toDictionary(
+        [
+            "contributing_dates",
+            "contributing_times",
+            "contributing_sensors",
+            "contributing_cloud_pct",
+            "contributing_marginal_gain_pct",
+            "contributing_image_ids",
+            "n_dates",
+            "n_dates_available",
+            "achieved_coverage_pct",
+        ]
+    ).getInfo()
+
+    achieved = meta["achieved_coverage_pct"]
+    product_type = (
+        "composite" if achieved >= config.COVERAGE_COMPLETE_PCT else "partial"
+    )
+    sensors = meta["contributing_sensors"] or []
+    unique_sensors = list(dict.fromkeys(sensors))  # dedupe, keep order
+    clouds = meta["contributing_cloud_pct"] or []
+    image_ids = meta["contributing_image_ids"] or []
+    return {
+        "dry_year": year,
+        "season_label": label,
+        "product_type": product_type,
+        "sensor": ",".join(unique_sensors),
+        "n_dates": int(meta["n_dates"]),
+        "dates": meta["contributing_dates"] or [],
+        "timestamps_utc": meta["contributing_times"] or [],
+        "cloud_pct": clouds[0] if clouds else None,  # composite seed's cloud
+        "achieved_coverage_pct": achieved,
+        "image_ids": ",".join(image_ids),
+        "marginal_gains": meta["contributing_marginal_gain_pct"] or [],
+        "n_dates_available": int(meta["n_dates_available"]),
+    }

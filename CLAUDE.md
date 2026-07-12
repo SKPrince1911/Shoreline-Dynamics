@@ -58,6 +58,17 @@ dominated, cyclone-affected. Target period: 1988–2025.
 - Landsat 7 SLC-off (after 2003-05) scenes are flagged and used ONLY to fill
   gaps (years with no other ≤10% image).
 
+## Naming convention (locked)
+- `dry_year` (int) is the CANONICAL key for every sort, join, and later rate
+  computation; it never changes form.
+- `season_label` (str) is the human-readable DISPLAY field:
+  `f"{dry_year-1}-{dry_year}"` (e.g. 1995 -> "1994-1995"), reflecting that the
+  dry season spans Nov of the prior calendar year through Mar of the labelled
+  year.
+- Both `dry_year` and `season_label` are present on EVERY feature, dict, and
+  DataFrame that carries a dry-season-year (candidates, ranked candidates,
+  selection, product recommendation, approvals CSV, final inventory).
+
 ## Conventions
 - CRS: EPSG:4326 for storage; EPSG:32646 (UTM 46N) for all metric operations.
 - Every function: docstring + type hints. Validate units at stage boundaries.
