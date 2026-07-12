@@ -4,7 +4,8 @@
 Q1-publishable, fully reproducible pipeline for satellite-derived shoreline
 (SDS) change and driver attribution along the ~92 km sandy/deltaic Cox's
 Bazar–Teknaf coast (Bay of Bengal). Meso-tidal (~3 m spring range), monsoon-
-dominated, cyclone-affected. Target period: 1988–2025.
+dominated, cyclone-affected. Target period: 1985–2025 (dry-season-years
+1984-1985 … 2024-2025).
 
 ## Execution model (IMPORTANT)
 - Claude Code (web) only WRITES/edits code in this repo.
@@ -13,6 +14,10 @@ dominated, cyclone-affected. Target period: 1988–2025.
 - Heavy logic lives in src/ modules (.py). The root notebook
   Shoreline_Dynamics.ipynb is a THIN driver: installs deps, authenticates GEE,
   imports src/, runs each phase.
+- Colab sync: the notebook setup cell is CLONE-OR-PULL (git pull -q if the repo
+  folder exists, else clone) so a session always runs the latest committed
+  code, and the imports cell calls importlib.reload(config); reload(data) so a
+  running kernel picks up the freshly pulled modules without a restart.
 - Pin dependencies in requirements.txt for reproducibility.
 
 ## Repo structure
@@ -24,7 +29,13 @@ dominated, cyclone-affected. Target period: 1988–2025.
 - src/drivers.py : wave/cyclone/SLR/sediment attribution        (Phase 5)
 
 ## Locked methodology (supersedes any old code)
-- Imagery: Sentinel-2 SR Harmonized + Landsat 5/7/8/9 Collection 2 L2.
+- Imagery: Sentinel-2 SR Harmonized + Landsat 4/5/7/8/9 Collection 2 L2.
+  Landsat 4 (TM) shares Landsat 5's exact band layout, QA_PIXEL masking, and
+  DN×0.0000275−0.2 scaling, and sits alongside L5 in the sensor tie-break.
+  Rationale: TM (Landsat 4/5) is the first SWIR-capable 30 m sensor (Aug 1982),
+  but Landsat 5 only became operational in March 1984, so 1985 is the first
+  dry-season-year with a realistic chance of complete coverage using identical
+  MNDWI/sub-pixel logic; earlier years are expected to be sparse.
 - Masking: Cloud Score+ for S2 (cs ~0.55); QA_PIXEL/CFMask for Landsat.
 - Composites: dry-season (Nov–Mar) annual medians for the trend layer; single
   tidally-corrected images for cyclone/monsoon event analysis.
@@ -68,6 +79,23 @@ dominated, cyclone-affected. Target period: 1988–2025.
 - Both `dry_year` and `season_label` are present on EVERY feature, dict, and
   DataFrame that carries a dry-season-year (candidates, ranked candidates,
   selection, product recommendation, approvals CSV, final inventory).
+
+## Product hierarchy (locked)
+- Per dry-season-year the recommended product is chosen in order:
+  1. `single` — the top coverage-first candidate that is full-coast
+     (`is_complete`, coverage ≥ COVERAGE_COMPLETE_PCT).
+  2. `composite` — otherwise the greedy minimal gap-fill composite (fewest
+     dates via set-cover) if it reaches COVERAGE_COMPLETE_PCT.
+  3. `partial` — the same composite when it cannot reach full coverage (the
+     highest-coverage product achieved is kept).
+  4. `none` — no usable imagery at all (achieved_coverage_pct = 0).
+- Every year is HUMAN-REVIEWED and the decision is RECORDED: approvals are
+  appended to a persistent CSV (Drive when mounted, else outputs/) written on
+  every call, with `review_status` in
+  {approved, approved_override, rejected, auto}. `approve_single` and
+  `force_composite` are recorded overrides; `reject` marks a year `none`.
+- The final inventory (build_inventory) uses the approved row per year when one
+  exists, else the automatic `year_product`, spanning all of 1985–2025.
 
 ## Conventions
 - CRS: EPSG:4326 for storage; EPSG:32646 (UTM 46N) for all metric operations.

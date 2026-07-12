@@ -93,7 +93,12 @@ METRIC_CRS: str = "EPSG:32646"   # UTM zone 46N; used for all metric operations.
 # ---------------------------------------------------------------------------
 # Study period (inclusive), ISO-8601 date strings
 # ---------------------------------------------------------------------------
-STUDY_START: str = "1988-01-01"  # <-- TUNABLE
+# TM (Landsat 4/5) is the first SWIR-capable 30 m sensor (Aug 1982), but
+# Landsat 5 only became operational in March 1984, so 1985 is the first
+# dry-season-year (1984-1985) with a realistic chance of complete coverage
+# using identical MNDWI/sub-pixel logic. Earlier years are expected to be
+# sparse. Dry-season-years then run 1985 through 2025.
+STUDY_START: str = "1985-01-01"  # <-- TUNABLE
 STUDY_END: str = "2025-12-31"    # <-- TUNABLE
 
 # ---------------------------------------------------------------------------
@@ -105,6 +110,9 @@ S2_SR_HARMONIZED: str = "COPERNICUS/S2_SR_HARMONIZED"
 CLOUD_SCORE_PLUS: str = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
 
 # Landsat Collection 2, Level 2 (surface reflectance) by sensor.
+# Landsat 4 TM shares Landsat 5's band layout, QA, and scaling exactly; it
+# extends the record back to 1982 (though useful data is sparse before 1985).
+LANDSAT4_C2_L2: str = "LANDSAT/LT04/C02/T1_L2"
 LANDSAT5_C2_L2: str = "LANDSAT/LT05/C02/T1_L2"
 LANDSAT7_C2_L2: str = "LANDSAT/LE07/C02/T1_L2"
 LANDSAT8_C2_L2: str = "LANDSAT/LC08/C02/T1_L2"

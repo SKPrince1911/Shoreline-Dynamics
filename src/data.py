@@ -28,6 +28,7 @@ from . import config
 _PRESENT_YEAR: int = 9999  # Sentinel for "still acquiring".
 
 _SENSOR_OPERATIONAL: Dict[str, Tuple[int, int]] = {
+    "L4": (1982, 1993),          # Landsat 4 TM (same band layout as L5).
     "L5": (1984, 2012),          # Landsat 5 TM.
     "L7": (1999, 2022),          # Landsat 7 ETM+ (SLC-off after 2003-05).
     "L8": (2013, _PRESENT_YEAR),  # Landsat 8 OLI/TIRS.
@@ -37,6 +38,7 @@ _SENSOR_OPERATIONAL: Dict[str, Tuple[int, int]] = {
 
 # Map each Landsat sensor label to its Collection 2 L2 collection ID.
 _LANDSAT_COLLECTIONS: Dict[str, str] = {
+    "L4": config.LANDSAT4_C2_L2,
     "L5": config.LANDSAT5_C2_L2,
     "L7": config.LANDSAT7_C2_L2,
     "L8": config.LANDSAT8_C2_L2,
@@ -66,6 +68,7 @@ _RESOLUTION_RANK: Dict[str, int] = {
     "S2": 0,   # 10 m Sentinel-2.
     "L8": 1,   # 30 m Landsat 8 OLI.
     "L9": 1,   # 30 m Landsat 9 OLI-2.
+    "L4": 2,   # 30 m Landsat 4 TM (same tier as L5).
     "L5": 2,   # 30 m Landsat 5 TM.
     "L7": 3,   # 30 m Landsat 7 ETM+ (SLC-off risk).
 }
@@ -1291,7 +1294,9 @@ def year_product(
     Uses the top-ranked full-coast single candidate when one exists (unless
     ``force_composite``), otherwise the greedy gap-fill composite — labelled
     ``'partial'`` when it cannot reach ``config.COVERAGE_COMPLETE_PCT`` (the
-    highest-coverage product achieved is kept either way).
+    highest-coverage product achieved is kept either way). A year with no usable
+    imagery at all returns ``product_type='none'`` and
+    ``achieved_coverage_pct=0`` rather than raising.
 
     Args:
         year: The dry-season-year label.
@@ -1301,7 +1306,8 @@ def year_product(
 
     Returns:
         A dict with keys ``dry_year``, ``season_label``, ``product_type``
-        (``'single'``/``'composite'``/``'partial'``), ``sensor``, ``n_dates``,
+        (``'single'``/``'composite'``/``'partial'``/``'none'``), ``sensor``,
+        ``n_dates``,
         ``dates`` (list), ``timestamps_utc`` (list), ``cloud_pct`` (the single
         scene's, or the composite seed's), ``achieved_coverage_pct``,
         ``image_ids`` (comma-joined), ``marginal_gains`` (list), and
@@ -1344,9 +1350,14 @@ def year_product(
     ).getInfo()
 
     achieved = meta["achieved_coverage_pct"]
-    product_type = (
-        "composite" if achieved >= config.COVERAGE_COMPLETE_PCT else "partial"
-    )
+    n_available = int(meta["n_dates_available"])
+    if n_available == 0:
+        # No usable imagery at all this dry-season-year.
+        product_type = "none"
+    elif achieved >= config.COVERAGE_COMPLETE_PCT:
+        product_type = "composite"
+    else:
+        product_type = "partial"
     sensors = meta["contributing_sensors"] or []
     unique_sensors = list(dict.fromkeys(sensors))  # dedupe, keep order
     clouds = meta["contributing_cloud_pct"] or []
