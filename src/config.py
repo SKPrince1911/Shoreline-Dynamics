@@ -130,6 +130,14 @@ COVERAGE_THRESHOLD_PCT: float = 95.0
 # threshold, so a slightly-clipped but clear image can still be selected
 # (flagged relaxed_coverage=True).  <-- TUNABLE
 COVERAGE_THRESHOLD_RELAXED_PCT: float = 90.0
+# A single scene at or above this AOI coverage counts as full-coast, so no
+# gap-fill composite is needed.  <-- TUNABLE
+COVERAGE_COMPLETE_PCT: float = 99.5
+
+# Scales (m) for AOI coverage/cloud reductions: a coarse grid for fast
+# screening and a finer grid for final coverage verification.  <-- TUNABLE
+COVERAGE_SCALE: int = 100
+COVERAGE_SCALE_FINE: int = 30
 # Landsat 7 lost its Scan Line Corrector after this date; later ETM+ scenes
 # have ~22% striping gaps and are used only to fill otherwise-empty years.
 SLC_OFF_DATE: str = "2003-05-31"

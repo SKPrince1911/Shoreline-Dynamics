@@ -16,7 +16,7 @@ driver notebook); it deliberately does NOT authenticate or initialize here.
 import ee
 
 from functools import reduce
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from . import config
 
@@ -49,10 +49,9 @@ _QA_CLOUD_BIT: int = 3          # Cloud.
 _QA_CLOUD_SHADOW_BIT: int = 4   # Cloud shadow.
 _QA_FILL_BIT: int = 0           # Fill / no-data (incl. Landsat 7 SLC-off gaps).
 
-# Common AOI analysis scale (m) for the per-date coverage/cloud reductions.
-# Uses the coarser Landsat pixel so metrics are comparable across sensors.
-# <-- TUNABLE
-_AOI_ANALYSIS_SCALE: int = 30
+# Common band names for harmonized true-color reflectance (0-1) carried by the
+# prepared per-scene images and used to build the fill composite.
+_RGB_BANDS: List[str] = ["R", "G", "B"]
 
 # How many sensor-date features to materialize per Earth Engine request.
 # Evaluating a whole aggregation-heavy FeatureCollection at once trips the "Too
@@ -304,6 +303,79 @@ def slc_off(sensor: str, date: str) -> bool:
     return sensor == "L7" and date > config.SLC_OFF_DATE
 
 
+def _aoi_pixel_count(aoi: ee.Geometry, scale: int) -> ee.Number:
+    """Count AOI pixels on a fixed grid: constant-1 clipped to the AOI.
+
+    Used as the coverage denominator. Counting a constant image and any valid
+    mask in the SAME projection (``config.METRIC_CRS``) at the same ``scale``
+    guarantees the two counts share a grid, so coverage never exceeds 100.
+    """
+    return ee.Number(
+        ee.Image.constant(1)
+        .clip(aoi)
+        .reduceRegion(
+            reducer=ee.Reducer.count(),
+            geometry=aoi,
+            scale=scale,
+            crs=config.METRIC_CRS,
+            maxPixels=int(1e10),
+            bestEffort=False,
+        )
+        .values()
+        .get(0)
+    )
+
+
+def _aoi_coverage_pct(
+    valid_mask: ee.Image, aoi: ee.Geometry, scale: int = config.COVERAGE_SCALE
+) -> ee.Number:
+    """AOI coverage % of a valid-data mask, clamped to 100.
+
+    Numerator (valid pixels) and denominator (all AOI pixels) are both reduced
+    with ``ee.Reducer.count()`` on the same grid (``config.METRIC_CRS`` at
+    ``scale``), so ``coverage = min(100, 100 * valid / total)``.
+
+    Args:
+        valid_mask: An image masked wherever data is absent (count ignores
+            masked pixels, so only valid pixels are counted).
+        aoi: Area of interest as an ``ee.Geometry``.
+        scale: Reduction scale in metres (default ``config.COVERAGE_SCALE``).
+
+    Returns:
+        Coverage percentage as an ``ee.Number`` in [0, 100].
+    """
+    total: ee.Number = _aoi_pixel_count(aoi, scale)
+    valid: ee.Number = ee.Number(
+        valid_mask.reduceRegion(
+            reducer=ee.Reducer.count(),
+            geometry=aoi,
+            scale=scale,
+            crs=config.METRIC_CRS,
+            maxPixels=int(1e10),
+            bestEffort=False,
+        )
+        .values()
+        .get(0)
+    )
+    return valid.divide(total).multiply(100).min(100)
+
+
+def _true_color_reflectance(image: ee.Image, sensor_label: str) -> ee.Image:
+    """Return harmonized 0-1 true-color reflectance renamed to R, G, B.
+
+    Sentinel-2 uses B4/B3/B2 divided by 10000; Landsat Collection 2 Level 2 uses
+    the sensor's SR red/green/blue bands scaled by 0.0000275 - 0.2.
+    """
+    if sensor_label == "S2":
+        return image.select(["B4", "B3", "B2"]).divide(10000).rename(_RGB_BANDS)
+    bands = (
+        ["SR_B4", "SR_B3", "SR_B2"]
+        if sensor_label in ("L8", "L9")
+        else ["SR_B3", "SR_B2", "SR_B1"]
+    )
+    return image.select(bands).multiply(0.0000275).add(-0.2).rename(_RGB_BANDS)
+
+
 def _prepare_landsat(
     collection_id: str,
     sensor_label: str,
@@ -314,10 +386,10 @@ def _prepare_landsat(
     """Prepare a Landsat collection for per-date mosaicking.
 
     Each returned image carries a ``cloudy`` band (1 where dilated-cloud,
-    cloud, or cloud-shadow is flagged, masked to valid data) and a ``valid``
-    band (1 over non-fill data, masked elsewhere — so Landsat 7 SLC-off gaps
-    reduce coverage), plus the ``sensor``, ``date``, and ``sensor_date``
-    grouping properties.
+    cloud, or cloud-shadow is flagged, masked to valid data), a ``valid`` band
+    (1 over non-fill data, masked elsewhere — so Landsat 7 SLC-off gaps reduce
+    coverage), and harmonized true-color ``R``/``G``/``B`` reflectance, plus the
+    ``sensor``, ``date``, and ``sensor_date`` grouping properties.
     """
     collection: ee.ImageCollection = (
         ee.ImageCollection(collection_id)
@@ -336,7 +408,10 @@ def _prepare_landsat(
             dilated.Or(cloud).Or(shadow).updateMask(data_mask).rename("cloudy")
         )
         valid: ee.Image = data_mask.selfMask().rename("valid")
-        return _tag_prepared(ee.Image.cat([cloudy, valid]), image, sensor_label)
+        rgb: ee.Image = _true_color_reflectance(image, sensor_label)
+        return _tag_prepared(
+            ee.Image.cat([cloudy, valid, rgb]), image, sensor_label
+        )
 
     return collection.map(_prepare)
 
@@ -345,9 +420,9 @@ def _prepare_s2(aoi: ee.Geometry, start: str, end: str) -> ee.ImageCollection:
     """Prepare Sentinel-2 SR Harmonized for per-date mosaicking.
 
     Each returned image carries a ``cloudy`` band (Cloud Score+ ``cs`` below
-    ``CS_THRESHOLD``, masked to valid data) and a ``valid`` band (1 over data,
-    masked elsewhere), plus the ``sensor``, ``date``, and ``sensor_date``
-    grouping properties.
+    ``CS_THRESHOLD``, masked to valid data), a ``valid`` band (1 over data,
+    masked elsewhere), and harmonized true-color ``R``/``G``/``B`` reflectance,
+    plus the ``sensor``, ``date``, and ``sensor_date`` grouping properties.
     """
     collection: ee.ImageCollection = (
         ee.ImageCollection(config.S2_SR_HARMONIZED)
@@ -367,7 +442,8 @@ def _prepare_s2(aoi: ee.Geometry, start: str, end: str) -> ee.ImageCollection:
             .rename("cloudy")
         )
         valid: ee.Image = data_mask.selfMask().rename("valid")
-        return _tag_prepared(ee.Image.cat([cloudy, valid]), image, "S2")
+        rgb: ee.Image = _true_color_reflectance(image, "S2")
+        return _tag_prepared(ee.Image.cat([cloudy, valid, rgb]), image, "S2")
 
     return collection.map(_prepare)
 
@@ -451,19 +527,9 @@ def _candidate_components(year: int, aoi: ee.Geometry):
     # Distinct sensor-date groups present this year.
     keys: ee.List = merged.aggregate_array("sensor_date").distinct()
     slc_off_millis: ee.Number = ee.Date(config.SLC_OFF_DATE).millis()
-    # Total AOI pixel count at the analysis scale, computed once and reused as
-    # the coverage denominator (keeps per-feature work to a single reduceRegion).
-    total_aoi_px: ee.Number = ee.Number(
-        ee.Image.constant(1)
-        .reduceRegion(
-            reducer=ee.Reducer.count(),
-            geometry=aoi,
-            scale=_AOI_ANALYSIS_SCALE,
-            maxPixels=1e9,
-            bestEffort=True,
-        )
-        .get("constant")
-    )
+    # Coverage denominator: AOI pixel count on the screening grid, computed once
+    # and reused so per-feature work stays a single reduceRegion.
+    total_aoi_px: ee.Number = _aoi_pixel_count(aoi, config.COVERAGE_SCALE)
     return merged, keys, total_aoi_px, slc_off_millis
 
 
@@ -494,20 +560,21 @@ def _candidates_fc(
         )
         mosaic: ee.Image = group.mosaic()
 
-        # One reduceRegion for both metrics: mean(cloudy) over observed pixels
-        # and count(valid) = number of data pixels in the AOI.
-        stats: ee.Dictionary = mosaic.reduceRegion(
+        # One reduceRegion (cloudy + valid only) for both metrics: mean(cloudy)
+        # over observed pixels and count(valid) = data pixels in the AOI. Pin the
+        # projection/scale so valid_count shares the total_aoi_px grid and
+        # coverage cannot exceed 100 (still clamped for safety).
+        stats: ee.Dictionary = mosaic.select(["cloudy", "valid"]).reduceRegion(
             reducer=ee.Reducer.mean().combine(
                 reducer2=ee.Reducer.count(), sharedInputs=True
             ),
             geometry=aoi,
-            scale=_AOI_ANALYSIS_SCALE,
-            maxPixels=1e9,
-            bestEffort=True,
+            scale=config.COVERAGE_SCALE,
+            crs=config.METRIC_CRS,
+            maxPixels=int(1e10),
+            bestEffort=False,
         )
         aoi_cloud_pct = ee.Number(stats.get("cloudy_mean")).multiply(100)
-        # Clamp to 100: Sentinel-2 mosaics can report ~100.5 because the coarse
-        # screening grid overcounts valid pixels near the AOI edge.
         aoi_coverage_pct = (
             ee.Number(stats.get("valid_count"))
             .divide(total_aoi_px)
@@ -740,21 +807,32 @@ def select_best(year: int, aoi: ee.Geometry) -> ee.Feature:
 
 
 def _ranked_rows(year: int, aoi: ee.Geometry) -> List[dict]:
-    """Return all candidate rows for the year, ranked (rank 0 = select_best pick).
+    """Return all candidate rows for the year, coverage-first ranked.
 
-    Order: tier-1 qualifying (strict coverage) then tier-2 relaxed coverage —
-    both cloud-OK, by :func:`_rank_key` — then the remainder by coverage
-    descending, cloud ascending. Each row gains ``rank`` (0-based) and the
-    booleans ``qualifies_95`` and ``qualifies_90``.
+    Ordering (rank 0 = top): candidates whose coverage reaches
+    ``COVERAGE_COMPLETE_PCT`` (``is_complete``) first, by cloud ascending; then
+    the rest by coverage descending, cloud ascending. Each row gains ``rank``
+    (0-based), ``is_complete``, and the (retained) booleans ``qualifies_95`` and
+    ``qualifies_90``.
     """
     rows = _materialize_candidates(year, aoi)
-    tier1, tier2, rest = _classify_candidates(rows)
+    complete = sorted(
+        [r for r in rows if r["aoi_coverage_pct"] >= config.COVERAGE_COMPLETE_PCT],
+        key=lambda r: r["aoi_cloud_pct"],
+    )
+    rest = sorted(
+        [r for r in rows if r["aoi_coverage_pct"] < config.COVERAGE_COMPLETE_PCT],
+        key=lambda r: (-r["aoi_coverage_pct"], r["aoi_cloud_pct"]),
+    )
     ranked: List[dict] = []
-    for index, row in enumerate(tier1 + tier2 + rest):
+    for index, row in enumerate(complete + rest):
         ranked.append(
             {
                 **row,
                 "rank": index,
+                "is_complete": bool(
+                    row["aoi_coverage_pct"] >= config.COVERAGE_COMPLETE_PCT
+                ),
                 "qualifies_95": bool(
                     row["aoi_coverage_pct"] >= config.COVERAGE_THRESHOLD_PCT
                     and _cloud_ok(row)
@@ -769,10 +847,12 @@ def _ranked_rows(year: int, aoi: ee.Geometry) -> List[dict]:
 
 
 def year_candidates_ranked(year: int, aoi: ee.Geometry) -> ee.FeatureCollection:
-    """Return all candidate sensor-dates for the year, ranked and flagged.
+    """Return all candidate sensor-dates for the year, coverage-first ranked.
 
-    Rank 0 is the :func:`select_best` pick. Each null-geometry feature carries
-    the candidate properties plus ``rank`` (0-based), ``qualifies_95``, and
+    Rank 0 is the top coverage-first candidate: full-coast (``is_complete``)
+    scenes first by cloud ascending, then the rest by coverage descending and
+    cloud ascending. Each null-geometry feature carries the candidate properties
+    plus ``rank`` (0-based), ``is_complete``, ``qualifies_95``, and
     ``qualifies_90``. Features are built from already-materialized scalars, so
     fetching this collection is cheap (no per-feature reductions).
 
@@ -861,3 +941,208 @@ def tidal_channels_fc() -> ee.FeatureCollection:
         for feature in geojson["features"]
     ]
     return ee.FeatureCollection(features)
+
+
+def _prepared_collections(
+    year: int, aoi: ee.Geometry, sensor: Optional[str] = None
+) -> List[ee.ImageCollection]:
+    """Return the prepared per-scene collections for a dry-season-year.
+
+    Reuses :func:`_prepare_landsat` / :func:`_prepare_s2` (which carry the
+    per-pixel ``cloudy`` mask, ``valid`` band, and harmonized ``R``/``G``/``B``
+    reflectance). If ``sensor`` is given (e.g. ``"L5"`` or ``"S2"``) only that
+    sensor family is included.
+    """
+    start, end = dry_season_window(year)
+    collections: List[ee.ImageCollection] = []
+    for label, collection_id in _LANDSAT_COLLECTIONS.items():
+        if sensor is not None and label != sensor:
+            continue
+        first, last = _SENSOR_OPERATIONAL[label]
+        if first <= year <= last:
+            collections.append(_prepare_landsat(collection_id, label, aoi, start, end))
+    if sensor is None or sensor == "S2":
+        s2_first, s2_last = _SENSOR_OPERATIONAL["S2"]
+        if s2_first <= year <= s2_last:
+            collections.append(_prepare_s2(aoi, start, end))
+    return collections
+
+
+def _clear_date_mosaic(group: ee.ImageCollection) -> ee.Image:
+    """Mosaic one sensor-date group keeping only clear (cloud-free) pixels.
+
+    Each scene's ``R``/``G``/``B`` reflectance is masked to where ``cloudy`` is
+    0 (clear), then the group is mosaicked. The result has bands ``R``, ``G``,
+    ``B`` present only over clear data.
+    """
+
+    def _clear(image: ee.Image) -> ee.Image:
+        clear_mask: ee.Image = image.select("cloudy").eq(0)
+        return image.select(_RGB_BANDS).updateMask(clear_mask)
+
+    return group.map(_clear).mosaic()
+
+
+def _empty_composite() -> ee.Image:
+    """An empty composite placeholder carrying zero-valued provenance metadata."""
+    return ee.Image().set(
+        {
+            "contributing_dates": ee.List([]),
+            "contributing_times": ee.List([]),
+            "contributing_coverage_pct": ee.List([]),
+            "n_dates": 0,
+            "achieved_coverage_pct": 0,
+        }
+    )
+
+
+def season_fill_composite(
+    year: int, aoi: ee.Geometry, sensor: Optional[str] = None
+) -> ee.Image:
+    """Build a provenance-tracked dry-season gap-fill composite.
+
+    Every dry-season scene (optionally restricted to one ``sensor`` family) is
+    grouped by sensor-date. For each date a CLEAR mosaic is built (only
+    cloud-free pixels) in harmonized 0-1 true-color (``R``, ``G``, ``B``), and
+    provenance bands — ``src_date`` (int ``YYYYMMDD``), ``src_time`` (Long,
+    ``system:time_start`` millis) and ``src_idx`` (0-based priority index) —
+    are added, masked to that mosaic's valid pixels. Dates are prioritized by
+    clear AOI coverage (highest = priority index 0). Because
+    ``ee.ImageCollection.mosaic()`` renders the last image on top, the images
+    are assembled lowest-priority first so the highest-coverage date wins.
+
+    Args:
+        year: The dry-season-year label.
+        aoi: Area of interest as an ``ee.Geometry``.
+        sensor: Optional sensor family to restrict to (e.g. ``"L5"``).
+
+    Returns:
+        The mosaicked ``ee.Image`` (bands ``R``, ``G``, ``B``, ``src_date``,
+        ``src_time``, ``src_idx``) clipped to the AOI, with properties
+        ``contributing_dates`` (``ee.List`` of ``YYYY-MM-DD``, priority order),
+        ``contributing_times`` (``ee.List`` of ISO strings),
+        ``contributing_coverage_pct`` (``ee.List`` of each date's individual
+        clear AOI coverage, priority order), ``n_dates``, and
+        ``achieved_coverage_pct`` (computed at ``config.COVERAGE_SCALE_FINE``).
+    """
+    collections = _prepared_collections(year, aoi, sensor)
+    if not collections:
+        return _empty_composite()
+    merged: ee.ImageCollection = reduce(
+        lambda acc, col: acc.merge(col), collections
+    )
+    keys: List[str] = merged.aggregate_array("sensor_date").distinct().getInfo()
+    if not keys:
+        return _empty_composite()
+
+    # Per-date clear mosaic + its clear AOI coverage (for prioritization) and
+    # earliest acquisition time. Evaluated one date at a time to bound work.
+    date_infos: List[dict] = []
+    for key in keys:
+        group = merged.filter(ee.Filter.eq("sensor_date", key))
+        clear = _clear_date_mosaic(group)
+        info = ee.Dictionary(
+            {
+                "coverage": _aoi_coverage_pct(clear.select("R"), aoi),
+                "time": group.aggregate_min("system:time_start"),
+            }
+        ).getInfo()
+        date_infos.append(
+            {
+                "date": key.split("_", 1)[1],
+                "coverage": info["coverage"],
+                "time": int(info["time"]),
+                "clear": clear,
+            }
+        )
+
+    # Priority order: highest clear coverage first (priority index 0).
+    priority = sorted(date_infos, key=lambda d: -d["coverage"])
+    for index, entry in enumerate(priority):
+        clear = entry["clear"]
+        valid = clear.select("R").mask()  # 1 where this date has clear data
+        src_date = (
+            ee.Image.constant(ee.Number.parse(entry["date"].replace("-", "")))
+            .toInt()
+            .rename("src_date")
+            .updateMask(valid)
+        )
+        src_time = (
+            ee.Image.constant(entry["time"]).toLong().rename("src_time").updateMask(valid)
+        )
+        src_idx = (
+            ee.Image.constant(index).toInt().rename("src_idx").updateMask(valid)
+        )
+        entry["tagged"] = clear.addBands([src_date, src_time, src_idx])
+
+    # mosaic() puts the LAST image on top, so assemble lowest-priority first.
+    ascending = sorted(priority, key=lambda d: d["coverage"])
+    composite = (
+        ee.ImageCollection([entry["tagged"] for entry in ascending])
+        .mosaic()
+        .clip(aoi)
+    )
+
+    contributing_dates = [entry["date"] for entry in priority]
+    contributing_times = ee.List(
+        [ee.Date(entry["time"]).format() for entry in priority]
+    )
+    contributing_coverage_pct = [entry["coverage"] for entry in priority]
+    achieved = _aoi_coverage_pct(
+        composite.select("R"), aoi, config.COVERAGE_SCALE_FINE
+    )
+    return composite.set(
+        {
+            "contributing_dates": contributing_dates,
+            "contributing_times": contributing_times,
+            "contributing_coverage_pct": contributing_coverage_pct,
+            "n_dates": len(priority),
+            "achieved_coverage_pct": achieved,
+        }
+    )
+
+
+def product_recommendation(year: int, aoi: ee.Geometry) -> ee.Dictionary:
+    """Recommend a single-scene product or a gap-fill composite for the year.
+
+    If the top coverage-first candidate is full-coast (``is_complete``), a
+    single scene suffices. Otherwise a :func:`season_fill_composite` is built and
+    labelled ``'composite'`` if its achieved coverage reaches
+    ``config.COVERAGE_COMPLETE_PCT``, else ``'partial'``.
+
+    Args:
+        year: The dry-season-year label.
+        aoi: Area of interest as an ``ee.Geometry``.
+
+    Returns:
+        An ``ee.Dictionary``. For a single scene: ``product_type='single'``,
+        ``date``, ``sensor``, ``cloud``, ``coverage``. For a composite:
+        ``product_type`` (``'composite'``/``'partial'``), ``n_dates``,
+        ``achieved_coverage_pct``, ``contributing_dates``.
+    """
+    ranked = _ranked_rows(year, aoi)
+    if ranked and ranked[0]["is_complete"]:
+        top = ranked[0]
+        return ee.Dictionary(
+            {
+                "product_type": "single",
+                "date": top["date"],
+                "sensor": top["sensor"],
+                "cloud": top["aoi_cloud_pct"],
+                "coverage": top["aoi_coverage_pct"],
+            }
+        )
+
+    composite = season_fill_composite(year, aoi)
+    achieved = ee.Number(composite.get("achieved_coverage_pct"))
+    product_type = ee.Algorithms.If(
+        achieved.gte(config.COVERAGE_COMPLETE_PCT), "composite", "partial"
+    )
+    return ee.Dictionary(
+        {
+            "product_type": product_type,
+            "n_dates": composite.get("n_dates"),
+            "achieved_coverage_pct": achieved,
+            "contributing_dates": composite.get("contributing_dates"),
+        }
+    )
