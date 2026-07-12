@@ -990,26 +990,61 @@ def _empty_composite() -> ee.Image:
             "contributing_dates": ee.List([]),
             "contributing_times": ee.List([]),
             "contributing_coverage_pct": ee.List([]),
+            "contributing_marginal_gain_pct": ee.List([]),
+            "contributing_cloud_pct": ee.List([]),
             "n_dates": 0,
+            "n_dates_available": 0,
             "achieved_coverage_pct": 0,
         }
     )
 
 
+def _marginal_gain_pct(
+    valid_binary: ee.Image, covered: ee.Image, total_px: ee.Number, aoi: ee.Geometry
+) -> ee.Number:
+    """Percent of the AOI a date would NEWLY cover on top of ``covered``.
+
+    ``valid_binary`` and ``covered`` are unmasked 0/1 images; the newly-covered
+    pixels (this date's valid pixels outside ``covered``) are summed on the
+    screening grid and divided by ``total_px``.
+    """
+    newly: ee.Image = valid_binary.And(covered.Not())
+    new_px = ee.Number(
+        newly.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=config.COVERAGE_SCALE,
+            crs=config.METRIC_CRS,
+            maxPixels=int(1e10),
+            bestEffort=False,
+        )
+        .values()
+        .get(0)
+    )
+    return new_px.divide(total_px).multiply(100)
+
+
 def season_fill_composite(
     year: int, aoi: ee.Geometry, sensor: Optional[str] = None
 ) -> ee.Image:
-    """Build a provenance-tracked dry-season gap-fill composite.
+    """Build a MINIMAL provenance-tracked dry-season gap-fill composite.
 
-    Every dry-season scene (optionally restricted to one ``sensor`` family) is
-    grouped by sensor-date. For each date a CLEAR mosaic is built (only
-    cloud-free pixels) in harmonized 0-1 true-color (``R``, ``G``, ``B``), and
-    provenance bands — ``src_date`` (int ``YYYYMMDD``), ``src_time`` (Long,
-    ``system:time_start`` millis) and ``src_idx`` (0-based priority index) —
-    are added, masked to that mosaic's valid pixels. Dates are prioritized by
-    clear AOI coverage (highest = priority index 0). Because
-    ``ee.ImageCollection.mosaic()`` renders the last image on top, the images
-    are assembled lowest-priority first so the highest-coverage date wins.
+    Rather than stacking every clear date, this selects the fewest dates that
+    complete the coast via greedy set-cover — each extra date adds another
+    acquisition time/tide that degrades the later tidal correction.
+
+    1. Build each sensor-date's CLEAR mosaic (cloud-free pixels only), its clear
+       AOI coverage, cloud %, and time.
+    2. Seed with the highest-coverage date; ties within
+       ``config.SEED_COVERAGE_TOLERANCE_PCT`` are broken by lowest cloud.
+    3. Greedily add the date with the largest marginal coverage gain (ties
+       within ``config.MARGINAL_GAIN_TOLERANCE_PCT`` broken by lowest cloud),
+       updating a running covered mask, until coverage reaches
+       ``config.COVERAGE_COMPLETE_PCT``, no dates remain, or the best gain falls
+       below ``config.MIN_MARGINAL_GAIN_PCT``.
+    4. ``src_idx`` follows selection order (0 = seed). Only the selected dates
+       are mosaicked, assembled in reverse selection order so the seed renders
+       last/on-top.
 
     Args:
         year: The dry-season-year label.
@@ -1018,12 +1053,12 @@ def season_fill_composite(
 
     Returns:
         The mosaicked ``ee.Image`` (bands ``R``, ``G``, ``B``, ``src_date``,
-        ``src_time``, ``src_idx``) clipped to the AOI, with properties
-        ``contributing_dates`` (``ee.List`` of ``YYYY-MM-DD``, priority order),
-        ``contributing_times`` (``ee.List`` of ISO strings),
-        ``contributing_coverage_pct`` (``ee.List`` of each date's individual
-        clear AOI coverage, priority order), ``n_dates``, and
-        ``achieved_coverage_pct`` (computed at ``config.COVERAGE_SCALE_FINE``).
+        ``src_time``, ``src_idx``) clipped to the AOI, with properties (in
+        selection order) ``contributing_dates``, ``contributing_times`` (ISO),
+        ``contributing_coverage_pct``, ``contributing_marginal_gain_pct`` (the
+        seed's equals its own coverage), and ``contributing_cloud_pct``, plus
+        ``n_dates`` (selected), ``n_dates_available`` (clear dates considered),
+        and ``achieved_coverage_pct`` (at ``config.COVERAGE_SCALE_FINE``).
     """
     collections = _prepared_collections(year, aoi, sensor)
     if not collections:
@@ -1035,32 +1070,101 @@ def season_fill_composite(
     if not keys:
         return _empty_composite()
 
-    # Per-date clear mosaic + its clear AOI coverage (for prioritization) and
-    # earliest acquisition time. Evaluated one date at a time to bound work.
+    total_px: ee.Number = _aoi_pixel_count(aoi, config.COVERAGE_SCALE)
+
+    # Per-date clear mosaic with its clear AOI coverage, cloud %, time, and an
+    # unmasked 0/1 valid mask (for the set-cover bookkeeping).
     date_infos: List[dict] = []
     for key in keys:
         group = merged.filter(ee.Filter.eq("sensor_date", key))
         clear = _clear_date_mosaic(group)
+        cloud = ee.Number(
+            group.mosaic()
+            .select("cloudy")
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=aoi,
+                scale=config.COVERAGE_SCALE,
+                crs=config.METRIC_CRS,
+                maxPixels=int(1e10),
+                bestEffort=False,
+            )
+            .values()
+            .get(0)
+        ).multiply(100)
         info = ee.Dictionary(
             {
                 "coverage": _aoi_coverage_pct(clear.select("R"), aoi),
+                "cloud": cloud,
                 "time": group.aggregate_min("system:time_start"),
             }
         ).getInfo()
         date_infos.append(
             {
+                "key": key,
                 "date": key.split("_", 1)[1],
                 "coverage": info["coverage"],
+                "cloud": info["cloud"],
                 "time": int(info["time"]),
                 "clear": clear,
+                "valid_binary": clear.select("R").mask(),  # 0/1, unmasked
             }
         )
 
-    # Priority order: highest clear coverage first (priority index 0).
-    priority = sorted(date_infos, key=lambda d: -d["coverage"])
-    for index, entry in enumerate(priority):
-        clear = entry["clear"]
-        valid = clear.select("R").mask()  # 1 where this date has clear data
+    # Seed: highest clear coverage; ties within tolerance -> lowest cloud.
+    best_cov = max(d["coverage"] for d in date_infos)
+    seed_pool = [
+        d
+        for d in date_infos
+        if d["coverage"] >= best_cov - config.SEED_COVERAGE_TOLERANCE_PCT
+    ]
+    seed = min(seed_pool, key=lambda d: d["cloud"])
+    seed["marginal_gain"] = seed["coverage"]  # seed's gain = its own coverage
+
+    selected: List[dict] = [seed]
+    remaining: List[dict] = [d for d in date_infos if d["key"] != seed["key"]]
+    covered: ee.Image = seed["valid_binary"]
+    achieved: float = seed["coverage"]
+
+    # Greedy fill: add the largest marginal gain until the coast is complete or
+    # no remaining date meaningfully helps.
+    while achieved < config.COVERAGE_COMPLETE_PCT and remaining:
+        gain_fc = ee.FeatureCollection(
+            [
+                ee.Feature(
+                    None,
+                    {
+                        "key": d["key"],
+                        "gain": _marginal_gain_pct(
+                            d["valid_binary"], covered, total_px, aoi
+                        ),
+                    },
+                )
+                for d in remaining
+            ]
+        )
+        gains = {
+            f["properties"]["key"]: f["properties"]["gain"]
+            for f in gain_fc.getInfo()["features"]
+        }
+        best_gain = max(gains.values())
+        if best_gain < config.MIN_MARGINAL_GAIN_PCT:
+            break
+        near = [
+            d
+            for d in remaining
+            if gains[d["key"]] >= best_gain - config.MARGINAL_GAIN_TOLERANCE_PCT
+        ]
+        chosen = min(near, key=lambda d: d["cloud"])
+        chosen["marginal_gain"] = gains[chosen["key"]]
+        selected.append(chosen)
+        remaining = [d for d in remaining if d["key"] != chosen["key"]]
+        covered = covered.Or(chosen["valid_binary"])
+        achieved += chosen["marginal_gain"]
+
+    # Tag selected dates; src_idx follows selection order (0 = seed).
+    for index, entry in enumerate(selected):
+        valid = entry["valid_binary"].selfMask()
         src_date = (
             ee.Image.constant(ee.Number.parse(entry["date"].replace("-", "")))
             .toInt()
@@ -1073,31 +1177,34 @@ def season_fill_composite(
         src_idx = (
             ee.Image.constant(index).toInt().rename("src_idx").updateMask(valid)
         )
-        entry["tagged"] = clear.addBands([src_date, src_time, src_idx])
+        entry["tagged"] = entry["clear"].addBands([src_date, src_time, src_idx])
 
-    # mosaic() puts the LAST image on top, so assemble lowest-priority first.
-    ascending = sorted(priority, key=lambda d: d["coverage"])
+    # mosaic() puts the LAST image on top, so assemble in reverse selection
+    # order -> the seed (index 0) renders on top.
     composite = (
-        ee.ImageCollection([entry["tagged"] for entry in ascending])
+        ee.ImageCollection([entry["tagged"] for entry in reversed(selected)])
         .mosaic()
         .clip(aoi)
     )
 
-    contributing_dates = [entry["date"] for entry in priority]
     contributing_times = ee.List(
-        [ee.Date(entry["time"]).format() for entry in priority]
+        [ee.Date(entry["time"]).format() for entry in selected]
     )
-    contributing_coverage_pct = [entry["coverage"] for entry in priority]
-    achieved = _aoi_coverage_pct(
+    achieved_fine = _aoi_coverage_pct(
         composite.select("R"), aoi, config.COVERAGE_SCALE_FINE
     )
     return composite.set(
         {
-            "contributing_dates": contributing_dates,
+            "contributing_dates": [entry["date"] for entry in selected],
             "contributing_times": contributing_times,
-            "contributing_coverage_pct": contributing_coverage_pct,
-            "n_dates": len(priority),
-            "achieved_coverage_pct": achieved,
+            "contributing_coverage_pct": [entry["coverage"] for entry in selected],
+            "contributing_marginal_gain_pct": [
+                entry["marginal_gain"] for entry in selected
+            ],
+            "contributing_cloud_pct": [entry["cloud"] for entry in selected],
+            "n_dates": len(selected),
+            "n_dates_available": len(date_infos),
+            "achieved_coverage_pct": achieved_fine,
         }
     )
 

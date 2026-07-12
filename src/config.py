@@ -138,6 +138,14 @@ COVERAGE_COMPLETE_PCT: float = 99.5
 # screening and a finer grid for final coverage verification.  <-- TUNABLE
 COVERAGE_SCALE: int = 100
 COVERAGE_SCALE_FINE: int = 30
+
+# Greedy gap-fill composite (minimal set-cover) tolerances, in percent.
+# Ties within a tolerance are broken by lowest cloud. A candidate date whose
+# marginal coverage gain is below the minimum is not added (avoids redundant
+# dates that would each add another acquisition time/tide).  <-- TUNABLE
+SEED_COVERAGE_TOLERANCE_PCT: float = 1.0
+MARGINAL_GAIN_TOLERANCE_PCT: float = 0.5
+MIN_MARGINAL_GAIN_PCT: float = 0.25
 # Landsat 7 lost its Scan Line Corrector after this date; later ETM+ scenes
 # have ~22% striping gaps and are used only to fill otherwise-empty years.
 SLC_OFF_DATE: str = "2003-05-31"
