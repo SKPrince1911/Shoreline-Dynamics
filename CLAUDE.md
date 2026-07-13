@@ -97,6 +97,13 @@ dominated, cyclone-affected. Target period: 1985–2025 (dry-season-years
 - The final inventory (build_inventory) uses the approved row per year when one
   exists, else the automatic `year_product`, spanning all of 1985–2025.
 
+## Output persistence (locked)
+- Colab-generated outputs (image_inventory.csv, the approvals CSV) are saved to
+  Google Drive AND pushed to GitHub automatically via `save_outputs()`, which
+  authenticates with a `GITHUB_TOKEN` stored in Colab Secrets (never printed or
+  written to a file). No manual upload step for generated outputs.
+- Only hand-made artifacts (e.g. QGIS files) are uploaded to the repo manually.
+
 ## Conventions
 - CRS: EPSG:4326 for storage; EPSG:32646 (UTM 46N) for all metric operations.
 - Every function: docstring + type hints. Validate units at stage boundaries.
