@@ -317,6 +317,18 @@ def slc_off(sensor: str, date: str) -> bool:
     return sensor == "L7" and date > config.SLC_OFF_DATE
 
 
+def _num_or_zero(value) -> ee.Number:
+    """Coalesce a possibly-null ``reduceRegion`` output to a numeric ``ee.Number``.
+
+    ``reduceRegion`` returns ``null`` for a band with no valid pixels in the
+    region (e.g. a scene whose footprint grazes the AOI but covers no AOI pixel
+    centre at the analysis scale). Feeding that null into arithmetic raises
+    "Parameter 'left' is required and may not be null"; this returns 0 for null
+    while preserving a genuine 0.
+    """
+    return ee.Number(ee.List([value, 0]).reduce(ee.Reducer.firstNonNull()))
+
+
 def _aoi_pixel_count(aoi: ee.Geometry, scale: int) -> ee.Number:
     """Count AOI pixels on a fixed grid: constant-1 clipped to the AOI.
 
@@ -324,7 +336,7 @@ def _aoi_pixel_count(aoi: ee.Geometry, scale: int) -> ee.Number:
     mask in the SAME projection (``config.METRIC_CRS``) at the same ``scale``
     guarantees the two counts share a grid, so coverage never exceeds 100.
     """
-    return ee.Number(
+    return _num_or_zero(
         ee.Image.constant(1)
         .clip(aoi)
         .reduceRegion(
@@ -359,7 +371,7 @@ def _aoi_coverage_pct(
         Coverage percentage as an ``ee.Number`` in [0, 100].
     """
     total: ee.Number = _aoi_pixel_count(aoi, scale)
-    valid: ee.Number = ee.Number(
+    valid: ee.Number = _num_or_zero(
         valid_mask.reduceRegion(
             reducer=ee.Reducer.count(),
             geometry=aoi,
@@ -588,9 +600,12 @@ def _candidates_fc(
             maxPixels=int(1e10),
             bestEffort=False,
         )
-        aoi_cloud_pct = ee.Number(stats.get("cloudy_mean")).multiply(100)
+        # Coalesce nulls: a scene grazing the AOI can have no valid pixels at
+        # the screening grid, making cloudy_mean/valid_count null. Such a scene
+        # scores 0 coverage and drops to the bottom of the ranking.
+        aoi_cloud_pct = _num_or_zero(stats.get("cloudy_mean")).multiply(100)
         aoi_coverage_pct = (
-            ee.Number(stats.get("valid_count"))
+            _num_or_zero(stats.get("valid_count"))
             .divide(total_aoi_px)
             .multiply(100)
             .min(100.0)
@@ -1027,7 +1042,7 @@ def _marginal_gain_pct(
     screening grid and divided by ``total_px``.
     """
     newly: ee.Image = valid_binary.And(covered.Not())
-    new_px = ee.Number(
+    new_px = _num_or_zero(
         newly.reduceRegion(
             reducer=ee.Reducer.sum(),
             geometry=aoi,
@@ -1096,7 +1111,7 @@ def season_fill_composite(
     for key in keys:
         group = merged.filter(ee.Filter.eq("sensor_date", key))
         clear = _clear_date_mosaic(group)
-        cloud = ee.Number(
+        cloud = _num_or_zero(
             group.mosaic()
             .select("cloudy")
             .reduceRegion(
