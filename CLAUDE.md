@@ -39,9 +39,12 @@ dominated, cyclone-affected. Target period: 1985–2025 (dry-season-years
 - Masking: Cloud Score+ for S2 (cs ~0.55); QA_PIXEL/CFMask for Landsat.
 - Composites: dry-season (Nov–Mar) annual medians for the trend layer; single
   tidally-corrected images for cyclone/monsoon event analysis.
-- Extraction: supervised sand/water/whitewater classifier + marching-squares
-  sub-pixel contour on the MNDWI interface (CoastSat/CoastSeg family).
-  NOT reduceToVectors / pixel thresholding.
+- Extraction: per-SCENE (D1) supervised LOCAL sand/water/whitewater/other
+  classifier (D3) + marching-squares sub-pixel contour on the water-index
+  interface (CoastSat/CoastSeg family); the water index is a benchmarked
+  PARAMETER, default MNDWI (D4). NOT reduceToVectors / pixel thresholding.
+  See "## Phase 2 — sub-pixel shoreline extraction (locked: D1–D7)" below,
+  which supersedes this line where they differ.
 - Tidal correction: FES2022 via pyTMD/pyfes; slope via CoastSat.slope
   (Lomb-Scargle). Horizontal shift X = (Z_tide - Z_MSL) / tan(beta).
 - Uncertainty: root-sum-of-squares per-shoreline budget (pixel, georef, tidal,
@@ -51,11 +54,63 @@ dominated, cyclone-affected. Target period: 1985–2025 (dry-season-years
   relative SLR, GBM sediment flux; Kamphuis longshore transport; Random Forest
   importance, GAM, wavelet coherence. Pre/post-monsoon & pre/post-cyclone windows.
 
+## Phase 2 — sub-pixel shoreline extraction (locked: D1–D7)
+These decisions are LOCKED (argued with citations in docs/PHASE2_SPEC.md) and
+supersede any older Phase-2 statement above. They do not alter the verified
+Phase 1 inventory (18 single / 19 composite / 1 partial / 3 gap).
+
+- **D1 — the extraction unit is the SCENE, never the dry-season-year.**
+  Shorelines are extracted per scene and merged as VECTORS; every output
+  segment retains its own `image_id` and `acq_datetime_utc`. Rationale: 19 of
+  the 38 year-products are multi-date set-cover mosaics — extracting from a
+  merged raster would destroy the scene→tide mapping and make those years
+  uncorrectable in Phase 3 (FES2022 tidal correction is per acquisition time).
+- **D2 — two shoreline series.**
+  - Series A = the 38 annual dry-season products (the trend layer).
+  - Series B = a dense, all-season series, 1999–2025, from L7/L8/L9/S2. It is
+    required for CoastSat.slope, which needs sub-monthly sampling: a 365-day
+    annual series aliases the tidal band entirely, so beach-slope estimation is
+    impossible from Series A alone.
+- **D3 — surface reflectance + a LOCAL classifier.**
+  Keep SR imagery (`S2_SR_HARMONIZED` + Landsat C2 L2). Train a local
+  sand/water/whitewater/other classifier in THREE sensor groups by band layout:
+  TM (L4/L5/L7 — ETM+ shares the TM band set), OLI (L8/L9), MSI (S2).
+  CoastSat's shipped classifiers are TOA-trained and are INVALID on SR imagery.
+- **D4 — the water index is a PARAMETER, not hardcoded.**
+  Choice is `{mndwi, ndwi, aweinsh, scowi} × {otsu, weighted_peaks}`,
+  benchmarked against manually digitised reference shorelines. Default `mndwi`
+  pending the benchmark. (AWEInsh needs SWIR2, so `swir2` is carried on every
+  fetched scene — see config BAND_MAP.)
+- **D5 — per-scene georeferencing RMSE is read from image metadata**, not
+  assumed constant, and feeds the per-shoreline uncertainty budget.
+- **D6 — inter-sensor bias quantification is a Phase 2 deliverable** (e.g. at
+  sensor-overlap dates on pixel-aligned grids), so cross-sensor offsets are
+  characterised before rates are computed.
+- **D7 — reported study period is 1988–2025 (38 dry-season-years).**
+  1985–87 is a Landsat archive gap (no usable imagery over the AOI). 1991
+  remains `partial` and carries an INFLATED uncertainty flag.
+
+### Phase 2 inputs — operator-digitised in QGIS (manual-artifact pathway)
+Uploaded by the operator via the GitHub web interface (NOT written by
+`save_outputs()`). Extraction code reads them; exact schemas are defined with
+the code that consumes them:
+- `data/shoreline_search_zone.geojson` — buffer/search zone constraining
+  extraction to the coast (suppresses false detections inland and offshore).
+- `data/training_polygons.geojson` — labelled polygons, `class ∈ {other, sand,
+  whitewater, water}`, per D3's three sensor groups.
+- `data/reference_shorelines/` — 10 manually digitised validation shorelines
+  for the D4 water-index/threshold benchmark.
+
 ## Temporal design (locked)
 - Annual shoreline is derived from the DRY SEASON ONLY (Nov–Mar); monsoon
-  months are excluded from the trend layer.
+  months are excluded from the trend layer. This annual layer is Series A (D2);
+  Phase 2 additionally builds Series B — a dense, all-season 1999–2025 series
+  needed for tidal-slope estimation (see D2 below).
 - One BEST (clearest) image per dry-season-year — a single scene, not a
-  composite — is selected for the annual shoreline.
+  composite — is selected for the annual shoreline. (This is the Phase 1
+  *product selection*. For Phase 2 *extraction*, the unit is the SCENE, not the
+  year: each contributing scene of a multi-date product is extracted separately
+  and the results merged as vectors — see D1 below.)
 - Cloud threshold: ≤10% cloud cover computed OVER THE AOI (per-pixel cloud
   mask reduced over the AOI polygon), NOT scene-wide metadata such as
   CLOUDY_PIXEL_PERCENTAGE / CLOUD_COVER.
