@@ -55,8 +55,9 @@ dominated, cyclone-affected. Target period: 1985–2025 (dry-season-years
   importance, GAM, wavelet coherence. Pre/post-monsoon & pre/post-cyclone windows.
 
 ## Phase 2 — sub-pixel shoreline extraction (locked: D1–D7)
-These decisions are LOCKED (argued with citations in docs/PHASE2_SPEC.md) and
-supersede any older Phase-2 statement above. They do not alter the verified
+These decisions are LOCKED (argued with citations in PHASE2_SPEC.md, the
+authoritative Phase 2 brief at the repo root) and supersede any older Phase-2
+statement above. They do not alter the verified
 Phase 1 inventory (18 single / 19 composite / 1 partial / 3 gap).
 
 - **D1 — the extraction unit is the SCENE, never the dry-season-year.**
