@@ -182,3 +182,88 @@ CYCLONE_EVENTS: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Directory (relative to the repository root) for generated artifacts.
 OUTPUT_DIR: str = "outputs"
+
+# ---------------------------------------------------------------------------
+# Phase 2 — sub-pixel shoreline extraction (see PHASE2_SPEC.md §1)
+# ---------------------------------------------------------------------------
+# Surface reflectance is retained (D3): Landsat C2 L2 + S2_SR_HARMONIZED. The
+# CoastSat-shipped classifiers are TOA-trained and invalid here, so a LOCAL
+# classifier is trained instead.
+REFLECTANCE_LEVEL: str = "SR"  # locked: Landsat C2 L2 + S2_SR_HARMONIZED
+
+# SR band aliases per sensor. Keys are the canonical names used everywhere
+# downstream; values are the native GEE band names. ``swir2`` is carried on
+# every scene because AWEInsh (a live water-index candidate, D4) needs it, and
+# retrofitting a band after fetch_scene exists means re-downloading every scene.
+#   Landsat TM/ETM+ (L4/L5/L7):  SR_B7 = SWIR2 (~2.2 um)
+#   Landsat OLI    (L8/L9):      SR_B7 = SWIR2 (~2.2 um)
+#   Sentinel-2 MSI (S2):         B12   = SWIR2 (~2.19 um); B11 = SWIR1
+BAND_MAP: Dict[str, Dict[str, str]] = {
+    "L4": {"blue": "SR_B1", "green": "SR_B2", "red": "SR_B3", "nir": "SR_B4", "swir1": "SR_B5", "swir2": "SR_B7"},
+    "L5": {"blue": "SR_B1", "green": "SR_B2", "red": "SR_B3", "nir": "SR_B4", "swir1": "SR_B5", "swir2": "SR_B7"},
+    "L7": {"blue": "SR_B1", "green": "SR_B2", "red": "SR_B3", "nir": "SR_B4", "swir1": "SR_B5", "swir2": "SR_B7"},
+    "L8": {"blue": "SR_B2", "green": "SR_B3", "red": "SR_B4", "nir": "SR_B5", "swir1": "SR_B6", "swir2": "SR_B7"},
+    "L9": {"blue": "SR_B2", "green": "SR_B3", "red": "SR_B4", "nir": "SR_B5", "swir1": "SR_B6", "swir2": "SR_B7"},
+    "S2": {"blue": "B2",    "green": "B3",    "red": "B4",    "nir": "B8",    "swir1": "B11",   "swir2": "B12"},
+}
+
+# Sensor -> reflectance-scale family. Used to look up SR_SCALE and the
+# per-family georef-RMSE fallback without hardcoding sensor lists downstream.
+SR_SCALE_FAMILY: Dict[str, str] = {
+    "L4": "LANDSAT", "L5": "LANDSAT", "L7": "LANDSAT",
+    "L8": "LANDSAT", "L9": "LANDSAT", "S2": "S2",
+}
+
+# Reflectance scaling to physical [0, 1], as (gain, offset): value*gain + offset.
+# Landsat C2 L2: DN*2.75e-5 - 0.2. S2_SR_HARMONIZED: DN/10000 (the harmonized
+# collection already removes the post-2022-01-25 baseline-04.00 +1000 offset —
+# this is why the HARMONIZED collection is used).
+SR_SCALE: Dict[str, tuple] = {
+    "LANDSAT": (2.75e-5, -0.2),
+    "S2": (1e-4, 0.0),
+}
+
+# Native analysis grid (m) per sensor. Pansharpening is OFF by default: the
+# Landsat pan band (B8) exists only in the L1 TOA collections, so pansharpening
+# SR multispectral requires a cross-product fetch. Evaluated as an option in the
+# benchmark (PHASE2_SPEC.md §6), not assumed.  <-- TUNABLE
+PIXEL_SIZE_M: Dict[str, int] = {
+    "L4": 30, "L5": 30, "L7": 30, "L8": 30, "L9": 30, "S2": 10,
+}
+PANSHARPEN: bool = False  # <-- TUNABLE
+
+# Fallback georeferencing RMSE (m) when per-scene metadata is absent (D5).
+# CoastSat uses 12 m as the Landsat-collection average.  <-- TUNABLE
+GEOREF_RMSE_DEFAULT_M: Dict[str, float] = {"LANDSAT": 12.0, "S2": 11.0}
+
+# Pixel classes (classifier output codes, D3).
+CLASS_OTHER: int = 0
+CLASS_SAND: int = 1
+CLASS_WHITEWATER: int = 2
+CLASS_WATER: int = 3
+
+# Water indices available to the benchmark (D4).  <-- TUNABLE
+WATER_INDICES: List[str] = ["mndwi", "ndwi", "aweinsh", "scowi"]
+WATER_INDEX_DEFAULT: str = "mndwi"
+THRESHOLD_METHODS: List[str] = ["otsu", "weighted_peaks"]
+THRESHOLD_METHOD_DEFAULT: str = "otsu"
+
+# Contour filtering.  <-- TUNABLE
+# CoastSat's default minimum is 500 m; this coast is ~90 km, so short spurious
+# contours (channels, cloud edges) are dropped at a higher floor.
+MIN_SHORELINE_LENGTH_M: float = 2000.0  # <-- TUNABLE
+# QGIS-digitised search zone constraining extraction to the coast (D1 filtering;
+# replaces CoastSat's scalar max_dist_ref). See PHASE2_SPEC.md §4.
+SEARCH_ZONE_PATH: str = "data/shoreline_search_zone.geojson"
+
+# Series B (dense, all-season 1999-2025) query envelope (D2).  <-- TUNABLE
+DENSE_START: str = "1999-01-01"
+DENSE_END: str = "2025-12-31"
+DENSE_SENSORS: List[str] = ["L7", "L8", "L9", "S2"]
+DENSE_CLOUD_MAX_PCT: float = 30.0     # relaxed vs the 10% annual rule
+DENSE_COVERAGE_MIN_PCT: float = 50.0  # partial scenes are still useful for slope
+
+# Landsat CFMask misflags bright beach/whitewater as cloud (CoastSat exposes
+# ``cloud_mask_issue`` for exactly this). When True, pixels flagged cloud but
+# classified sand/whitewater with high confidence are NOT masked.  <-- TUNABLE
+LANDSAT_CLOUD_MASK_ISSUE: bool = True
