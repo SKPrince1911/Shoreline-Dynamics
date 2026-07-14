@@ -256,6 +256,15 @@ MIN_SHORELINE_LENGTH_M: float = 2000.0  # <-- TUNABLE
 # replaces CoastSat's scalar max_dist_ref). See PHASE2_SPEC.md §4.
 SEARCH_ZONE_PATH: str = "data/shoreline_search_zone.geojson"
 
+# A dry-season composite whose contributing acquisitions span more than this many
+# days mixes shoreline positions from different parts of the season (e.g. 1995 =
+# 1994-11-20 + 1995-03-19, 119 days apart). Per-scene extraction (D1) fixes the
+# tide problem for these but not the temporal one. The scene list, shoreline
+# records, and merged annual file carry ``composite_date_spread_days``; years
+# above this threshold are flagged so Phase 4 can add an E_temporal term to the
+# RSS budget (~ local change rate x spread/2).  <-- TUNABLE
+COMPOSITE_SPREAD_FLAG_DAYS: float = 60.0
+
 # Series B (dense, all-season 1999-2025) query envelope (D2).  <-- TUNABLE
 DENSE_START: str = "1999-01-01"
 DENSE_END: str = "2025-12-31"

@@ -90,6 +90,16 @@ Phase 1 inventory (18 single / 19 composite / 1 partial / 3 gap).
 - **D7 — reported study period is 1988–2025 (38 dry-season-years).**
   1985–87 is a Landsat archive gap (no usable imagery over the AOI). 1991
   remains `partial` and carries an INFLATED uncertainty flag.
+- **Composite temporal spread (E_temporal precursor).** A dry-season composite
+  whose contributing acquisitions span a wide window mixes shoreline positions
+  from different parts of the season (e.g. 1995 = 1994-11-20 + 1995-03-19, 119
+  days; also 2005, 2010, 2011, 2014 > 60 days). Per-scene extraction (D1) fixes
+  the tide problem but not this temporal one. The scene list, per-scene shoreline
+  records, and `sds_annual_merged.geojson` carry `composite_date_spread_days`
+  (max−min of the product's contributing dates; 0 for single-date products);
+  years above `config.COMPOSITE_SPREAD_FLAG_DAYS` (60) are flagged
+  (`composite_spread_gt_60d`). Phase 4 turns this into an `E_temporal` RSS term
+  (≈ local change rate × spread/2); Phase 2 only records the field and flag.
 
 ### Phase 2 inputs — operator-digitised in QGIS (manual-artifact pathway)
 Uploaded by the operator via the GitHub web interface (NOT written by

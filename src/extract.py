@@ -113,9 +113,9 @@ SCENE_LIST_DENSE_PATH: str = os.path.join(config.OUTPUT_DIR, "scene_list_dense.c
 OUTPUT_SCHEMA: List[str] = [
     "image_id", "sensor", "sensor_group", "acq_datetime_utc", "dry_year",
     "season_label", "series", "pixel_size_m", "georef_rmse_m", "aoi_cloud_pct",
-    "aoi_coverage_pct", "slc_off", "water_index", "threshold_method",
-    "threshold_value", "classifier_version", "length_m", "n_vertices",
-    "pct_aoi_alongshore_covered", "flags",
+    "aoi_coverage_pct", "slc_off", "composite_date_spread_days", "water_index",
+    "threshold_method", "threshold_value", "classifier_version", "length_m",
+    "n_vertices", "pct_aoi_alongshore_covered", "flags",
 ]
 
 # Reusable CRS transformers (EPSG:4326 <-> EPSG:32646, always lon/lat order).
@@ -242,6 +242,15 @@ def build_scene_list_annual(
         times = [t.strip() for t in str(r["timestamps_utc"]).split(";") if t.strip()]
         # Map each contributing date to its acquisition timestamp.
         date_to_time = dict(zip(dates, times))
+        # Product-level temporal spread: days between the earliest and latest
+        # contributing acquisitions (0 for a single-date product). Every scene of
+        # a multi-date composite carries the SAME value, so the merged annual
+        # shoreline knows its segments come from up to this many days apart.
+        parsed_dates = sorted(pd.Timestamp(d) for d in dates)
+        spread_days = (
+            int((parsed_dates[-1] - parsed_dates[0]).days)
+            if len(parsed_dates) > 1 else 0
+        )
         # Group granules by their own parsed date.
         by_date: Dict[str, List[str]] = {}
         for g in granules:
@@ -264,6 +273,7 @@ def build_scene_list_annual(
                     "aoi_cloud_pct": _to_float(r.get("cloud_pct")),
                     "aoi_coverage_pct": _to_float(r.get("achieved_coverage_pct")),
                     "slc_off": bool(data.slc_off(sensor, date)),
+                    "composite_date_spread_days": spread_days,
                     "georef_rmse_m": np.nan,
                     "product_type": r.get("product_type"),
                     "review_status": r.get("review_status"),
@@ -403,6 +413,8 @@ def build_scene_list_dense(
                 "aoi_cloud_pct": float(rec["aoi_cloud_pct"]),
                 "aoi_coverage_pct": float(rec["aoi_coverage_pct"]),
                 "slc_off": bool(rec["slc_off"]),
+                # Each dense scene is a single acquisition -> no composite spread.
+                "composite_date_spread_days": 0,
                 "georef_rmse_m": np.nan,
             }
         )
@@ -1210,6 +1222,9 @@ def _attach_row_metadata(scene: Scene, row: pd.Series) -> Scene:
     scene._aoi_cloud_pct = _to_float(row.get("aoi_cloud_pct"))
     scene._aoi_coverage_pct = _to_float(row.get("aoi_coverage_pct"))
     scene._slc_off = bool(row.get("slc_off", False))
+    scene._composite_date_spread_days = _to_float(
+        row.get("composite_date_spread_days", 0)
+    )
     return scene
 
 
@@ -1236,6 +1251,7 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
     n_vertices = _count_vertices(line_utm)
     geom_wgs = _to_wgs(line_utm) if line_utm is not None else None
     dry_year = int(getattr(scene, "_dry_year", 0))
+    spread_days = float(getattr(scene, "_composite_date_spread_days", 0.0) or 0.0)
 
     flags: List[str] = []
     if bool(getattr(scene, "_slc_off", False)):
@@ -1244,6 +1260,8 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         flags.append("partial_1991_inflated_uncertainty")
     if scene.sensor in ("L4", "L5", "L7") and config.LANDSAT_CLOUD_MASK_ISSUE:
         flags.append("landsat_cloud_mask_issue")
+    if spread_days > config.COMPOSITE_SPREAD_FLAG_DAYS:
+        flags.append(f"composite_spread_gt_{int(config.COMPOSITE_SPREAD_FLAG_DAYS)}d")
     if line_utm is None:
         flags.append("no_shoreline")
 
@@ -1260,6 +1278,7 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         "aoi_cloud_pct": getattr(scene, "_aoi_cloud_pct", None),
         "aoi_coverage_pct": getattr(scene, "_aoi_coverage_pct", None),
         "slc_off": bool(getattr(scene, "_slc_off", False)),
+        "composite_date_spread_days": spread_days,
         "water_index": settings["water_index"],
         "threshold_method": settings["threshold_method"],
         "threshold_value": float(threshold),
@@ -1392,8 +1411,9 @@ def merge_annual(gdf: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame":
     )
     keep = [
         "dry_year", "season_label", "source_image_id", "source_acq_datetime_utc",
-        "sensor", "sensor_group", "series", "water_index", "threshold_method",
-        "threshold_value", "georef_rmse_m", "length_m", "flags", "geometry",
+        "sensor", "sensor_group", "series", "composite_date_spread_days",
+        "water_index", "threshold_method", "threshold_value", "georef_rmse_m",
+        "length_m", "flags", "geometry",
     ]
     cols = [c for c in keep if c in series_a.columns]
     out = series_a[cols].sort_values(["dry_year", "source_acq_datetime_utc"])
