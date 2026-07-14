@@ -408,6 +408,7 @@ def _prepare_landsat(
     aoi: ee.Geometry,
     start: str,
     end: str,
+    all_season: bool = False,
 ) -> ee.ImageCollection:
     """Prepare a Landsat collection for per-date mosaicking.
 
@@ -416,13 +417,21 @@ def _prepare_landsat(
     (1 over non-fill data, masked elsewhere — so Landsat 7 SLC-off gaps reduce
     coverage), and harmonized true-color ``R``/``G``/``B`` reflectance, plus the
     ``sensor``, ``date``, and ``sensor_date`` grouping properties.
+
+    Args:
+        all_season: When ``False`` (default, the Phase 1 behaviour) the dry-season
+            month filter (Nov–Mar) is applied. When ``True`` no month filter is
+            applied, so monsoon scenes are retained — used to build the Phase 2
+            Series B dense, all-season list (D2). All existing Phase 1 callers
+            omit this argument and are therefore unchanged.
     """
     collection: ee.ImageCollection = (
         ee.ImageCollection(collection_id)
         .filterBounds(aoi)
         .filterDate(start, end)
-        .filter(dry_season_month_filter())
     )
+    if not all_season:
+        collection = collection.filter(dry_season_month_filter())
 
     def _prepare(image: ee.Image) -> ee.Image:
         qa: ee.Image = image.select("QA_PIXEL")
@@ -442,20 +451,31 @@ def _prepare_landsat(
     return collection.map(_prepare)
 
 
-def _prepare_s2(aoi: ee.Geometry, start: str, end: str) -> ee.ImageCollection:
+def _prepare_s2(
+    aoi: ee.Geometry, start: str, end: str, all_season: bool = False
+) -> ee.ImageCollection:
     """Prepare Sentinel-2 SR Harmonized for per-date mosaicking.
 
     Each returned image carries a ``cloudy`` band (Cloud Score+ ``cs`` below
     ``CS_THRESHOLD``, masked to valid data), a ``valid`` band (1 over data,
     masked elsewhere), and harmonized true-color ``R``/``G``/``B`` reflectance,
     plus the ``sensor``, ``date``, and ``sensor_date`` grouping properties.
+
+    Args:
+        all_season: When ``False`` (default, the Phase 1 behaviour) the dry-season
+            month filter (Nov–Mar) is applied. When ``True`` no month filter is
+            applied (monsoon scenes retained) for the Phase 2 Series B dense list
+            (D2). Existing Phase 1 callers omit this argument and are unchanged.
     """
     collection: ee.ImageCollection = (
         ee.ImageCollection(config.S2_SR_HARMONIZED)
         .filterBounds(aoi)
         .filterDate(start, end)
-        .filter(dry_season_month_filter())
-        .linkCollection(ee.ImageCollection(config.CLOUD_SCORE_PLUS), ["cs"])
+    )
+    if not all_season:
+        collection = collection.filter(dry_season_month_filter())
+    collection = collection.linkCollection(
+        ee.ImageCollection(config.CLOUD_SCORE_PLUS), ["cs"]
     )
 
     def _prepare(image: ee.Image) -> ee.Image:
