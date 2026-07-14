@@ -248,10 +248,12 @@ WATER_INDEX_DEFAULT: str = "mndwi"
 THRESHOLD_METHODS: List[str] = ["otsu", "weighted_peaks"]
 THRESHOLD_METHOD_DEFAULT: str = "otsu"
 
-# Contour filtering.  <-- TUNABLE
-# CoastSat's default minimum is 500 m; this coast is ~90 km, so short spurious
-# contours (channels, cloud edges) are dropped at a higher floor.
-MIN_SHORELINE_LENGTH_M: float = 2000.0  # <-- TUNABLE
+# Contour filtering: minimum length of a MERGED shoreline segment (applied AFTER
+# linemerge, so fragmented contours from cloud edges or L7 SLC-off striping are
+# stitched before this floor is applied). This coast is cut by 13 tidal channels,
+# so legitimate inter-channel shoreline segments are well under 2 km — the floor
+# only removes short spurious specks, not real inter-channel reaches.  <-- TUNABLE
+MIN_SHORELINE_LENGTH_M: float = 300.0  # <-- TUNABLE
 # QGIS-digitised search zone constraining extraction to the coast (D1 filtering;
 # replaces CoastSat's scalar max_dist_ref). See PHASE2_SPEC.md §4.
 SEARCH_ZONE_PATH: str = "data/shoreline_search_zone.geojson"

@@ -111,6 +111,10 @@ the code that consumes them:
   whitewater, water}`, per D3's three sensor groups.
 - `data/reference_shorelines/` — 10 manually digitised validation shorelines
   for the D4 water-index/threshold benchmark.
+- `data/baseline.geojson` — a single smooth LineString landward of and roughly
+  parallel to the coast; `extract.build_transects()` casts shore-normal DSAS
+  transects from it (default 50 m spacing, 1500 m long) to
+  `outputs/transects.geojson` for the benchmark and inter-sensor bias (D6).
 
 ## Temporal design (locked)
 - Annual shoreline is derived from the DRY SEASON ONLY (Nov–Mar); monsoon

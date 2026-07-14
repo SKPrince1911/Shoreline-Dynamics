@@ -32,6 +32,7 @@ pixel-aligned — required for the inter-sensor bias test and the benchmark).
 from __future__ import annotations
 
 import csv
+import math
 import os
 import urllib.request
 from dataclasses import dataclass
@@ -43,7 +44,9 @@ import pandas as pd
 
 import geopandas as gpd
 import pyproj
-from shapely.geometry import LineString, MultiLineString, Polygon, mapping
+from shapely.geometry import (
+    LineString, MultiLineString, Polygon, box, mapping,
+)
 from shapely.ops import linemerge, transform as shapely_transform, unary_union
 from rasterio import features as rio_features
 from rasterio.io import MemoryFile
@@ -108,6 +111,14 @@ SDS_SCENES_PATH: str = os.path.join(SHORELINE_DIR, "sds_scenes.geojson")
 SDS_ANNUAL_PATH: str = os.path.join(SHORELINE_DIR, "sds_annual_merged.geojson")
 EXTRACTION_LOG_PATH: str = os.path.join(config.OUTPUT_DIR, "extraction_log.csv")
 SCENE_LIST_DENSE_PATH: str = os.path.join(config.OUTPUT_DIR, "scene_list_dense.csv")
+
+# Transects (DSAS/QSCAT convention) — cast shore-normal from an operator-digitised
+# baseline for the benchmark and inter-sensor bias. Kept in extract.py for now;
+# Phase 4 (change.py) can adopt them.
+BASELINE_PATH: str = "data/baseline.geojson"
+TRANSECTS_PATH: str = os.path.join(config.OUTPUT_DIR, "transects.geojson")
+TRANSECT_SPACING_M: float = 50.0     # <-- TUNABLE (alongshore spacing between transects)
+TRANSECT_LENGTH_M: float = 1500.0    # <-- TUNABLE (seaward reach from the baseline)
 
 # The locked one-LineString-per-scene attribute schema (geometry stored aside).
 OUTPUT_SCHEMA: List[str] = [
@@ -532,13 +543,17 @@ def _download_tiled(
     scale: int,
     resample: bool,
     tile_px: int = DEFAULT_TILE_PX,
+    keep_geom: Optional[Polygon] = None,
 ) -> Dict[str, np.ndarray]:
     """Fetch an ``ee.Image`` onto the fixed grid, tile by tile, as NumPy arrays.
 
     The AOI is ~90 km long, so a single ``getDownloadURL`` exceeds GEE's payload
     limit; the grid is fetched in ``tile_px`` blocks and stitched. ``resample``
     selects bilinear (reflectance) vs nearest (integer QA bit-masks — bilinear
-    would corrupt the flags).
+    would corrupt the flags). Tiles whose footprint does not intersect
+    ``keep_geom`` (the search-zone/extraction polygon, EPSG:32646) are skipped
+    and left NaN — the fetch grid is the bbox of an irregular coastal band, so
+    this avoids downloading (and holding in RAM) the empty corner tiles.
 
     Returns a dict of ``band_name -> (height, width) float32`` arrays.
     """
@@ -550,6 +565,11 @@ def _download_tiled(
         for c0 in range(0, width, tile_px):
             th = min(tile_px, height - r0)
             tw = min(tile_px, width - c0)
+            if keep_geom is not None:
+                tile_box = box(x0 + c0 * scale, y1 - (r0 + th) * scale,
+                               x0 + (c0 + tw) * scale, y1 - r0 * scale)
+                if not keep_geom.intersects(tile_box):
+                    continue
             tile_transform = [scale, 0.0, x0 + c0 * scale, 0.0, -scale, y1 - r0 * scale]
             params = {
                 "bands": band_names,
@@ -621,7 +641,9 @@ def fetch_scene(
     scale = config.PIXEL_SIZE_M[sensor]
     granules = [g.strip() for g in str(row["image_id"]).split(",") if g.strip()]
 
-    # Fixed grid over the requested region (default: search zone else AOI).
+    # Fixed grid over the requested region (default: search zone else AOI). The
+    # region polygon also drives per-tile skipping: only tiles that intersect it
+    # are downloaded (the grid is the bbox of an irregular coastal band).
     region = region_utm if region_utm is not None else extraction_region_utm()
     minx, miny, maxx, maxy = region.bounds
     transform, width, height = _fixed_grid(minx, miny, maxx, maxy, scale)
@@ -632,7 +654,7 @@ def fetch_scene(
     refl_image = ee.ImageCollection(refl_imgs).mosaic()
     refl_raw = _download_tiled(
         refl_image, CANONICAL_BANDS, transform, width, height, scale,
-        resample=True, tile_px=tile_px,
+        resample=True, tile_px=tile_px, keep_geom=region,
     )
     gain, offset = config.SR_SCALE[family]
     bands: Dict[str, np.ndarray] = {
@@ -645,7 +667,7 @@ def fetch_scene(
                    for g in granules]
         cs = _download_tiled(
             ee.ImageCollection(cs_imgs).mosaic(), ["cs"], transform, width, height,
-            scale, resample=False, tile_px=tile_px,
+            scale, resample=False, tile_px=tile_px, keep_geom=region,
         )["cs"]
         observed = np.isfinite(cs)
         cloud = observed & (cs < config.CS_THRESHOLD)
@@ -657,6 +679,7 @@ def fetch_scene(
         qa = _download_tiled(
             ee.ImageCollection(qa_imgs).mosaic(), ["QA_PIXEL", "QA_RADSAT"],
             transform, width, height, scale, resample=False, tile_px=tile_px,
+            keep_geom=region,
         )
         qap = np.nan_to_num(qa["QA_PIXEL"], nan=1.0).astype(np.uint16)
         radsat = np.nan_to_num(qa["QA_RADSAT"], nan=1.0).astype(np.uint16)
@@ -763,17 +786,51 @@ def _base_layers(scene: Scene) -> Dict[str, np.ndarray]:
     return layers
 
 
-def _feature_stack(scene: Scene) -> np.ndarray:
-    """Build the ``(H, W, 20)`` per-pixel feature cube (order = ``FEATURE_NAMES``).
+def _iter_feature_layers(scene: Scene):
+    """Yield the 20 feature layers one at a time (order = ``FEATURE_NAMES``).
 
-    Ten base layers (6 reflectances + MNDWI/NDWI/NDVI/MNDWI2) each contribute
-    their value and their 3x3 local std (texture separates bright whitewater from
-    dry sand) — the CoastSat-style 20-feature vector (D3).
+    Ten base layers (6 reflectances + MNDWI/NDWI/NDVI/MNDWI2), then their 3x3
+    local std (texture separates bright whitewater from dry sand). Yielding one
+    (H, W) layer at a time — rather than stacking all 20 — keeps peak memory to a
+    couple of full arrays instead of ~20x the grid (a 10 m search-zone bbox is
+    tens of millions of pixels; a 20-deep float32 stack would be gigabytes).
     """
     layers = _base_layers(scene)
-    feats = [layers[name] for name in _FEATURE_BASE]
-    feats += [_local_std(layers[name]) for name in _FEATURE_BASE]
-    return np.stack(feats, axis=-1).astype(np.float32)
+    for name in _FEATURE_BASE:
+        yield layers[name]
+    for name in _FEATURE_BASE:
+        yield _local_std(layers[name])
+
+
+def _feature_matrix(scene: Scene, mask: np.ndarray) -> np.ndarray:
+    """Build the ``(N, 20)`` feature matrix for the ``mask`` pixels only.
+
+    Extracts each feature layer's values at the ``N = mask.sum()`` selected
+    pixels without ever materialising the full ``(H, W, 20)`` cube — the layer is
+    freed before the next is built.
+    """
+    flat = mask.reshape(-1)
+    cols = [layer.reshape(-1)[flat] for layer in _iter_feature_layers(scene)]
+    return np.column_stack(cols).astype(np.float32) if cols else np.empty((0, feats_dim()))
+
+
+def _search_zone_mask(scene: Scene) -> np.ndarray:
+    """Rasterise the search zone onto the scene grid (all-True if none exists).
+
+    Restricting classification to this mask keeps inland aquaculture ponds and
+    the Bakkhali/Naf estuaries out of the feature stack and the Otsu histogram,
+    and bounds the number of pixels ``clf.predict`` runs on.
+    """
+    zone = load_search_zone()
+    if zone is None:
+        return np.ones(scene.valid.shape, dtype=bool)
+    return rio_features.rasterize(
+        [(mapping(zone), 1)],
+        out_shape=scene.valid.shape,
+        transform=scene.transform,
+        fill=0,
+        dtype="uint8",
+    ).astype(bool)
 
 
 def build_training_set(
@@ -799,25 +856,27 @@ def build_training_set(
     xs: List[np.ndarray] = []
     ys: List[np.ndarray] = []
     for scene in scenes:
-        height, width = scene.valid.shape
-        feats = _feature_stack(scene)
+        # Burn every labelled polygon into one class-code raster (last polygon
+        # wins on overlap), then extract features once for all labelled pixels —
+        # no full-scene feature cube is built.
+        class_map = np.full(scene.valid.shape, -1, dtype=np.int16)
         for _, poly in gdf.iterrows():
             if poly.geometry is None or poly.geometry.is_empty:
                 continue
             code = _class_code(poly["class"])
-            mask = rio_features.rasterize(
+            burned = rio_features.rasterize(
                 [(mapping(poly.geometry), 1)],
-                out_shape=(height, width),
+                out_shape=scene.valid.shape,
                 transform=scene.transform,
                 fill=0,
                 dtype="uint8",
             ).astype(bool)
-            sel = mask & scene.valid
-            n = int(sel.sum())
-            if n == 0:
-                continue
-            xs.append(feats[sel])
-            ys.append(np.full(n, code, dtype=int))
+            class_map[burned & scene.valid] = code
+        sample = class_map >= 0
+        if not sample.any():
+            continue
+        xs.append(_feature_matrix(scene, sample))
+        ys.append(class_map[sample].astype(int))
     if not xs:
         raise ValueError(
             "no training pixels sampled — check that training polygons overlap "
@@ -893,22 +952,33 @@ def evaluate_classifier(
     return report
 
 
-def classify_scene(scene: Scene, clf: Pipeline) -> np.ndarray:
+def classify_scene(
+    scene: Scene, clf: Pipeline, zone_mask: Optional[np.ndarray] = None
+) -> np.ndarray:
     """Classify a scene into {other, sand, whitewater, water} codes (D3).
 
-    Invalid pixels are forced to ``CLASS_OTHER`` so downstream sand/water
-    selection (which also ANDs the valid mask) never uses them.
+    Only pixels inside the search zone AND valid are classified; everything else
+    is ``CLASS_OTHER``. This bounds ``clf.predict`` to the coastal band (a
+    whole-grid 20-feature predict on tens of millions of 10 m pixels would
+    OOM/crawl in Colab) and keeps inland ponds/estuaries out of the interface
+    used for the Otsu threshold.
+
+    Args:
+        zone_mask: Optional precomputed search-zone boolean mask (same shape as
+            ``scene.valid``); computed from the digitised zone when omitted.
 
     Returns:
         An ``(H, W)`` int array in {0, 1, 2, 3}.
     """
     height, width = scene.valid.shape
-    feats = _feature_stack(scene).reshape(-1, feats_dim())
-    valid = scene.valid.reshape(-1)
+    if zone_mask is None:
+        zone_mask = _search_zone_mask(scene)
+    mask = scene.valid & zone_mask
     labels = np.full(height * width, config.CLASS_OTHER, dtype=int)
-    if valid.any():
-        X = np.nan_to_num(feats[valid], nan=0.0, posinf=0.0, neginf=0.0)
-        labels[valid] = clf.predict(X)
+    flat = mask.reshape(-1)
+    if flat.any():
+        X = np.nan_to_num(_feature_matrix(scene, mask), nan=0.0, posinf=0.0, neginf=0.0)
+        labels[flat] = clf.predict(X)
     return labels.reshape(height, width)
 
 
@@ -1126,13 +1196,21 @@ def filter_contours(
 ):
     """Reduce raw contours to a single ordered shoreline geometry.
 
+    Order matters: the min-length filter is applied AFTER the merge, otherwise
+    fragmented contours (cloud edges, and especially L7 SLC-off striping gaps in
+    2002/2003/2013) would be deleted before they could stitch into one shoreline.
+
     1. Clip to the search zone (removes inland/offshore false detections).
     2. Handle tidal-channel mouths: within a buffer of each closure line, drop
        contour parts that run landward (up the channel) and splice in the closure
-       line so the shoreline follows the mouth-closing segment instead (D1). The
-       land side is taken as east (``LAND_IS_EAST``) — this coast faces west.
-    3. Drop segments shorter than ``min_length_m``.
-    4. Merge and order alongshore (north -> south).
+       line — only where a contour actually reaches the mouth — so the shoreline
+       follows the mouth-closing segment (D1). Land is east (``LAND_IS_EAST``);
+       this coast faces west.
+    3. ``unary_union`` + ``linemerge`` to stitch the fragments into continuous
+       reaches.
+    4. THEN drop merged reaches shorter than ``min_length_m`` (spurious specks
+       only — real inter-channel reaches survive).
+    5. Order alongshore (north -> south).
 
     Returns:
         A ``LineString``/``MultiLineString`` (EPSG:32646), or ``None`` if nothing
@@ -1148,13 +1226,13 @@ def filter_contours(
     if not parts:
         return None
 
+    # Splice channel closures BEFORE merging so mouth-bridging segments join the
+    # adjacent reaches; only THEN drop short *merged* reaches.
     parts = _apply_channel_closures(parts, channel_lines)
-    parts = [ln for ln in parts if ln.length >= min_length_m]
-    if not parts:
-        return None
-
     merged = linemerge(unary_union(parts))
-    ordered = _as_line_list(merged)
+    ordered = [ln for ln in _as_line_list(merged) if ln.length >= min_length_m]
+    if not ordered:
+        return None
     ordered.sort(key=lambda ln: ln.centroid.y, reverse=True)  # north (higher y) first
     if len(ordered) == 1:
         return ordered[0]
@@ -1164,11 +1242,13 @@ def filter_contours(
 def _apply_channel_closures(
     lines: List[LineString], channel_lines: List[LineString]
 ) -> List[LineString]:
-    """Trim up-channel contour intrusions and bridge each mouth with its closure.
+    """Trim up-channel contour intrusions and bridge reached mouths with closures.
 
     For each closure line, contour material within ``CHANNEL_BUFFER_M`` that lies
-    landward of the mouth (east when ``LAND_IS_EAST``) is discarded; the closure
-    line itself is then added so the shoreline crosses the mouth along it.
+    landward of the mouth (east when ``LAND_IS_EAST``) is discarded. The closure
+    line is spliced in **only when a contour actually reaches that mouth** — an
+    unconditional splice would add all 13 closure lines to every scene (and, with
+    the corrected order, leave stray closure stubs where no shoreline reaches).
     """
     if not channel_lines:
         return lines
@@ -1177,11 +1257,13 @@ def _apply_channel_closures(
         buf = closure.buffer(CHANNEL_BUFFER_M)
         xs = [c[0] for c in closure.coords]
         mouth_x = max(xs) if LAND_IS_EAST else min(xs)
+        touched = False
         kept: List[LineString] = []
         for ln in out:
             if not ln.intersects(buf):
                 kept.append(ln)
                 continue
+            touched = True
             kept.extend(_as_line_list(ln.difference(buf)))  # outside the mouth: keep
             for part in _as_line_list(ln.intersection(buf)):
                 seaward = (part.centroid.x <= mouth_x if LAND_IS_EAST
@@ -1190,7 +1272,8 @@ def _apply_channel_closures(
                     kept.append(part)  # near the mouth but seaward: keep
                 # landward (up-channel): dropped
         out = kept
-        out.append(closure)  # bridge the mouth
+        if touched:
+            out.append(closure)  # bridge only mouths the shoreline actually reaches
     return out
 
 
@@ -1423,6 +1506,83 @@ def merge_annual(gdf: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame":
 # ===========================================================================
 # 6.  Benchmark + validation (Phase 2 deliverables)
 # ===========================================================================
+def build_transects(
+    baseline_path: str = BASELINE_PATH,
+    spacing_m: float = TRANSECT_SPACING_M,
+    length_m: float = TRANSECT_LENGTH_M,
+    write: bool = True,
+) -> "gpd.GeoDataFrame":
+    """Cast shore-normal transects from a digitised baseline (DSAS/QSCAT).
+
+    Reads ``data/baseline.geojson`` — a single LineString digitised landward of
+    and roughly parallel to the coast — and casts transects every ``spacing_m``
+    along it, each ``length_m`` long and normal to the local baseline tangent,
+    pointing seaward (west, since ``LAND_IS_EAST``). Each transect is a
+    ``LineString`` ordered land->sea (vertex 0 on the baseline) with a stable
+    integer ``transect_id`` increasing alongshore — the convention
+    :func:`benchmark_extraction` and :func:`intersensor_bias` expect.
+
+    Args:
+        baseline_path: Path to the digitised baseline GeoJSON (EPSG:4326).
+        spacing_m: Alongshore spacing between transects.
+        length_m: Seaward reach of each transect from the baseline.
+        write: Write ``outputs/transects.geojson`` (EPSG:4326) when True.
+
+    Returns:
+        A ``GeoDataFrame`` of transects in EPSG:4326 with ``transect_id``.
+    """
+    gdf = gpd.read_file(baseline_path).to_crs(config.METRIC_CRS)
+    base = linemerge(unary_union(list(gdf.geometry)))
+    baseline_parts = _as_line_list(base)
+    if not baseline_parts:
+        raise ValueError(f"{baseline_path} has no LineString baseline")
+
+    records: List[dict] = []
+    tid = 0
+    for line in baseline_parts:
+        n = int(np.floor(line.length / spacing_m))
+        for i in range(n + 1):
+            d = i * spacing_m
+            p = line.interpolate(d)
+            eps = max(1.0, min(spacing_m, line.length) * 0.5)
+            a = line.interpolate(max(0.0, d - eps))
+            b = line.interpolate(min(line.length, d + eps))
+            tx, ty = (b.x - a.x), (b.y - a.y)
+            norm = math.hypot(tx, ty) or 1.0
+            tx, ty = tx / norm, ty / norm
+            nx, ny = -ty, tx  # left normal of the tangent
+            # Orient seaward: land is east, so seaward normals have nx < 0.
+            if (nx > 0) == LAND_IS_EAST:
+                nx, ny = -nx, -ny
+            end = (p.x + nx * length_m, p.y + ny * length_m)
+            records.append({
+                "transect_id": tid,
+                "geometry": LineString([(p.x, p.y), end]),
+            })
+            tid += 1
+
+    out = gpd.GeoDataFrame(records, geometry="geometry", crs=config.METRIC_CRS)
+    out = out.to_crs(config.STORAGE_CRS)
+    if write:
+        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+        out.to_file(TRANSECTS_PATH, driver="GeoJSON")
+    return out
+
+
+def load_transects(path: str = TRANSECTS_PATH) -> "gpd.GeoDataFrame":
+    """Load ``outputs/transects.geojson`` reprojected to EPSG:32646 (metric).
+
+    The benchmark and inter-sensor bias measure distances along transects, so
+    they need them in the metric CRS. Build them first with
+    :func:`build_transects`.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found — run build_transects() (needs data/baseline.geojson)"
+        )
+    return gpd.read_file(path).to_crs(config.METRIC_CRS)
+
+
 def _intersection_distance(line, transect, origin) -> float:
     """Distance from ``origin`` to where ``line`` meets ``transect`` (NaN if none)."""
     if line is None:
@@ -1471,7 +1631,7 @@ def _labels_all_interface(scene: Scene) -> np.ndarray:
 def benchmark_extraction(
     scenes: List[Scene],
     reference_shorelines: "gpd.GeoDataFrame",
-    transects: "gpd.GeoDataFrame",
+    transects: Optional["gpd.GeoDataFrame"] = None,
     classifiers: Optional[Dict[str, Pipeline]] = None,
     indices: Sequence[str] = tuple(config.WATER_INDICES),
     threshold_methods: Sequence[str] = tuple(config.THRESHOLD_METHODS),
@@ -1484,13 +1644,16 @@ def benchmark_extraction(
     bias, MAE) so the operational configuration can be selected and a paper
     figure produced. Reference shorelines are matched to a scene by ``image_id``
     (an ``image_id`` column on the reference layer). ``transects`` must be in
-    EPSG:32646.
+    EPSG:32646; when omitted they are loaded from ``outputs/transects.geojson``
+    (build them once with :func:`build_transects`).
 
     Returns:
         A tidy DataFrame: one row per ``(sensor_group, water_index,
         threshold_method, classifier)`` with ``rmse_m``, ``bias_m``, ``mae_m``,
         ``n``.
     """
+    if transects is None:
+        transects = load_transects()
     ref_by_id = {
         str(r["image_id"]): r.geometry for _, r in reference_shorelines.iterrows()
     }
@@ -1543,7 +1706,7 @@ def benchmark_extraction(
 
 def intersensor_bias(
     gdf: "gpd.GeoDataFrame",
-    transects: "gpd.GeoDataFrame",
+    transects: Optional["gpd.GeoDataFrame"] = None,
     max_days: int = 2,
 ) -> pd.DataFrame:
     """Quantify cross-sensor offset from near-coincident scene pairs (D6/§6).
@@ -1553,12 +1716,15 @@ def intersensor_bias(
     L5+L7 2001/2005 overlaps and the 2016–2021 L8/L9×S2 overlap). A significant,
     consistent offset is the most obvious confound for a 40-year multi-sensor
     trend; report it (and correct it) before computing rates. ``transects`` must
-    be in EPSG:32646.
+    be in EPSG:32646; when omitted they are loaded from
+    ``outputs/transects.geojson`` (build them with :func:`build_transects`).
 
     Returns:
         One row per sensor pair with ``mean_offset_m``, ``std_offset_m``,
         ``median_offset_m``, ``n_pairs``, ``n_transect_samples``.
     """
+    if transects is None:
+        transects = load_transects()
     g = gdf.copy()
     g["_t"] = pd.to_datetime(g["acq_datetime_utc"], utc=True)
     pairs: Dict[Tuple[str, str], List[float]] = {}
