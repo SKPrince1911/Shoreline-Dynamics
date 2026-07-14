@@ -569,7 +569,11 @@ def _download_geotiff(
     raise RuntimeError(f"tile download failed after {DOWNLOAD_RETRIES} tries: {last_exc}")
 
 
-def fetch_scene(row: pd.Series, tile_px: int = DEFAULT_TILE_PX) -> Scene:
+def fetch_scene(
+    row: pd.Series,
+    tile_px: int = DEFAULT_TILE_PX,
+    region_utm: Optional[Polygon] = None,
+) -> Scene:
     """Fetch one scene onto the fixed EPSG:32646 grid as a :class:`Scene` (D1/D5).
 
     Steps:
@@ -590,6 +594,10 @@ def fetch_scene(row: pd.Series, tile_px: int = DEFAULT_TILE_PX) -> Scene:
     Args:
         row: A scene-list row (from :func:`build_scene_list_annual`/``_dense``).
         tile_px: Fetch tile size in pixels.
+        region_utm: Optional EPSG:32646 polygon to fetch instead of the default
+            extraction region (search zone else full AOI). Pass a small window
+            for cheap visual QC before the search zone has been digitised, or to
+            keep Sentinel-2 arrays inside Colab RAM.
 
     Returns:
         The populated :class:`Scene`.
@@ -601,8 +609,8 @@ def fetch_scene(row: pd.Series, tile_px: int = DEFAULT_TILE_PX) -> Scene:
     scale = config.PIXEL_SIZE_M[sensor]
     granules = [g.strip() for g in str(row["image_id"]).split(",") if g.strip()]
 
-    # Fixed grid over the extraction region (search zone else AOI).
-    region = extraction_region_utm()
+    # Fixed grid over the requested region (default: search zone else AOI).
+    region = region_utm if region_utm is not None else extraction_region_utm()
     minx, miny, maxx, maxy = region.bounds
     transform, width, height = _fixed_grid(minx, miny, maxx, maxy, scale)
 
