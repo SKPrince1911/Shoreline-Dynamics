@@ -44,6 +44,7 @@ import pandas as pd
 
 import geopandas as gpd
 import pyproj
+import rasterio
 from shapely.geometry import (
     LineString, MultiLineString, Polygon, box, mapping,
 )
@@ -745,6 +746,59 @@ def _read_time_start(meta_img: "ee.Image", row: pd.Series) -> pd.Timestamp:
     return _parse_utc(str(row.get("acq_datetime_utc")))
 
 
+def export_scene_geotiff(
+    row: pd.Series,
+    path: str,
+    bands: Sequence[str] = ("red", "green", "blue", "swir1"),
+    region_utm: Optional[Polygon] = None,
+    tile_px: int = DEFAULT_TILE_PX,
+) -> str:
+    """Fetch a scene and write it as a georeferenced multi-band GeoTIFF (UTM 46N).
+
+    Writes the scaled reflectance ``bands`` on the exact fixed EPSG:32646 grid the
+    pipeline extracts from, so training polygons and reference shorelines digitised
+    over this file in QGIS line up pixel-for-pixel with what the classifier and
+    contour see. Invalid pixels are written as NaN nodata (transparent in QGIS).
+
+    Args:
+        row: A scene-list row (as for :func:`fetch_scene`).
+        path: Output ``.tif`` path (e.g. on the mounted Drive).
+        bands: Canonical band names to write, in order (default R, G, B, SWIR1 —
+            SWIR1 makes the wet/dry line and water easy to see).
+        region_utm: Optional EPSG:32646 fetch window (see :func:`fetch_scene`).
+        tile_px: Fetch tile size.
+
+    Returns:
+        ``path`` (the file written).
+    """
+    scene = fetch_scene(row, tile_px=tile_px, region_utm=region_utm)
+    stack = np.stack([scene.bands[b] for b in bands], axis=0).astype(np.float32)
+    height, width = scene.valid.shape
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": len(bands),
+        "dtype": "float32",
+        "crs": config.METRIC_CRS,
+        "transform": scene.transform,
+        "nodata": float("nan"),
+        "compress": "deflate",
+    }
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(stack)
+        for i, name in enumerate(bands, start=1):
+            dst.set_band_description(i, name)
+        dst.update_tags(
+            image_id=scene.image_id,
+            sensor=scene.sensor,
+            acq_datetime_utc=str(scene.acq_datetime_utc),
+            pixel_size_m=str(scene.pixel_size_m),
+        )
+    return path
+
+
 # ===========================================================================
 # 2.3  Classifier (D3)
 # ===========================================================================
@@ -952,6 +1006,27 @@ def evaluate_classifier(
     return report
 
 
+def _majority_filter_labels(labels: np.ndarray, size: int = 3) -> np.ndarray:
+    """3x3 majority (modal) filter of a discrete class-label raster.
+
+    Vectorised over the four classes: the count of each class in the ``size`` x
+    ``size`` window (including the centre) is computed with a box filter, and each
+    pixel takes the most common class. Operates on the LABEL MAP only — never the
+    water index or the contour. Ties break toward the lower class code.
+    """
+    classes = [config.CLASS_OTHER, config.CLASS_SAND, config.CLASS_WHITEWATER,
+               config.CLASS_WATER]
+    # uniform_filter gives the window mean of the 0/1 membership; the argmax is
+    # unchanged by the constant 1/window-size factor, so no need to rescale.
+    counts = np.stack(
+        [ndimage.uniform_filter((labels == c).astype(np.float32), size=size,
+                                 mode="nearest")
+         for c in classes],
+        axis=0,
+    )
+    return np.asarray(classes)[np.argmax(counts, axis=0)].astype(labels.dtype)
+
+
 def classify_scene(
     scene: Scene, clf: Pipeline, zone_mask: Optional[np.ndarray] = None
 ) -> np.ndarray:
@@ -961,7 +1036,10 @@ def classify_scene(
     is ``CLASS_OTHER``. This bounds ``clf.predict`` to the coastal band (a
     whole-grid 20-feature predict on tens of millions of 10 m pixels would
     OOM/crawl in Colab) and keeps inland ponds/estuaries out of the interface
-    used for the Otsu threshold.
+    used for the Otsu threshold. When ``config.LABEL_MAJORITY_FILTER`` a 3x3
+    majority filter cleans label speckle (which would otherwise poison the
+    sand∪water histogram) — applied to the LABEL MAP only, never the index or
+    contour.
 
     Args:
         zone_mask: Optional precomputed search-zone boolean mask (same shape as
@@ -979,7 +1057,12 @@ def classify_scene(
     if flat.any():
         X = np.nan_to_num(_feature_matrix(scene, mask), nan=0.0, posinf=0.0, neginf=0.0)
         labels[flat] = clf.predict(X)
-    return labels.reshape(height, width)
+    labels = labels.reshape(height, width)
+    if config.LABEL_MAJORITY_FILTER and flat.any():
+        # Filter the label raster, then re-force out-of-zone pixels back to OTHER
+        # so the filter cannot leak classes past the search-zone boundary.
+        labels = np.where(mask, _majority_filter_labels(labels), config.CLASS_OTHER)
+    return labels
 
 
 # ===========================================================================

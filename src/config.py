@@ -242,6 +242,14 @@ CLASS_SAND: int = 1
 CLASS_WHITEWATER: int = 2
 CLASS_WATER: int = 3
 
+# Apply a 3x3 majority filter to the classifier LABEL MAP (only) after predict,
+# before it reaches the interface threshold. Speckled misclassification poisons
+# the sand-union-water histogram and drifts the Otsu threshold. This filters the
+# discrete label raster, NOT the water index or the sub-pixel contour (those are
+# never smoothed — that would reintroduce the pixel quantisation this design
+# avoids).  <-- TUNABLE
+LABEL_MAJORITY_FILTER: bool = True
+
 # Water indices available to the benchmark (D4).  <-- TUNABLE
 WATER_INDICES: List[str] = ["mndwi", "ndwi", "aweinsh", "scowi"]
 WATER_INDEX_DEFAULT: str = "mndwi"
