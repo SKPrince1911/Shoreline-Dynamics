@@ -1666,38 +1666,63 @@ def load_transects(path: str = TRANSECTS_PATH) -> "gpd.GeoDataFrame":
     return gpd.read_file(path).to_crs(config.METRIC_CRS)
 
 
-def _intersection_distance(line, transect, origin) -> float:
-    """Distance from ``origin`` to where ``line`` meets ``transect`` (NaN if none)."""
+def _transect_crossings(line, transect, origin) -> List[float]:
+    """Land->sea distances from ``origin`` to every crossing of ``line``.
+
+    Returns a sorted list of the distances at which ``line`` crosses ``transect``
+    (empty if it never does). A shore-normal transect can cross a complex
+    shoreline more than once (spits, channel mouths, double sandbars near
+    Bakkhali and the Naf), so ALL crossings are returned — letting the caller
+    detect and exclude multi-crossing transects rather than silently collapsing
+    them to one point. A rare collinear (LineString) overlap contributes its
+    representative point.
+    """
     if line is None:
-        return float("nan")
+        return []
     inter = line.intersection(transect)
     if inter.is_empty:
-        return float("nan")
-    if inter.geom_type == "Point":
-        return float(origin.distance(inter))
-    pts = [g for g in getattr(inter, "geoms", [inter]) if g.geom_type == "Point"]
-    if not pts:
-        pts = [inter.representative_point()]
-    return float(min(origin.distance(p) for p in pts))
+        return []
+    dists: List[float] = []
+    for g in getattr(inter, "geoms", [inter]):
+        if g.geom_type == "Point":
+            dists.append(float(origin.distance(g)))
+        else:  # collinear LineString/MultiLineString overlap (degenerate)
+            dists.append(float(origin.distance(g.representative_point())))
+    return sorted(dists)
 
 
-def _transect_offsets(line_a, line_b, transects: "gpd.GeoDataFrame") -> np.ndarray:
+def _transect_offsets(
+    line_a, line_b, transects: "gpd.GeoDataFrame"
+) -> Tuple[np.ndarray, np.ndarray]:
     """Signed cross-shore offsets (m) between two shorelines along transects.
 
-    For each transect (a cross-shore ``LineString`` ordered land->sea), the
-    distance from its start to the intersection with each shoreline is measured;
-    the offset is ``d(line_a) − d(line_b)`` (positive = A seaward of B). Transects
-    that miss either shoreline yield ``NaN``. All geometries must be in a metric
-    CRS (EPSG:32646).
+    For each transect (a cross-shore ``LineString`` ordered land->sea) the offset
+    is ``d(line_a) − d(line_b)`` (positive = A seaward of B), where each ``d`` is
+    the land->sea distance from the transect origin to the shoreline crossing.
+
+    A transect contributes an offset ONLY when each shoreline crosses it exactly
+    once. If either line crosses more than once, the transect is flagged
+    multi-crossing and its offset is ``NaN`` — excluded rather than resolved by an
+    arbitrary nearest-crossing pick, which would inject a systematic landward bias
+    exactly at the complex mouths (and inflate the benchmark RMSE). Transects that
+    miss either line are also ``NaN`` (but not flagged multi). All geometries must
+    be in a metric CRS (EPSG:32646).
+
+    Returns:
+        ``(offsets, multi)`` — a float array of offsets (``NaN`` where excluded or
+        missing) and a bool array marking transects excluded because either line
+        crossed more than once.
     """
     offsets: List[float] = []
+    multi: List[bool] = []
     for _, t in transects.iterrows():
         tr = t.geometry
         origin = tr.interpolate(0.0)
-        da = _intersection_distance(line_a, tr, origin)
-        db = _intersection_distance(line_b, tr, origin)
-        offsets.append(da - db if (np.isfinite(da) and np.isfinite(db)) else np.nan)
-    return np.asarray(offsets, dtype=float)
+        ca = _transect_crossings(line_a, tr, origin)
+        cb = _transect_crossings(line_b, tr, origin)
+        multi.append(len(ca) > 1 or len(cb) > 1)
+        offsets.append(ca[0] - cb[0] if (len(ca) == 1 and len(cb) == 1) else np.nan)
+    return np.asarray(offsets, dtype=float), np.asarray(multi, dtype=bool)
 
 
 def _labels_all_interface(scene: Scene) -> np.ndarray:
@@ -1733,7 +1758,8 @@ def benchmark_extraction(
     Returns:
         A tidy DataFrame: one row per ``(sensor_group, water_index,
         threshold_method, classifier)`` with ``rmse_m``, ``bias_m``, ``mae_m``,
-        ``n``.
+        ``n`` (transects used) and ``n_multi_excluded`` (transects dropped because
+        a shoreline crossed them more than once — reported for honesty).
     """
     if transects is None:
         transects = load_transects()
@@ -1746,7 +1772,7 @@ def benchmark_extraction(
     for use_clf in use_classifier_options:
         for name in indices:
             for method in threshold_methods:
-                acc: Dict[str, List[float]] = {}
+                acc: Dict[str, Dict[str, object]] = {}
                 for scene in scenes:
                     ref = ref_by_id.get(scene.image_id)
                     if ref is None:
@@ -1766,10 +1792,12 @@ def benchmark_extraction(
                         line_utm = _to_utm(line) if line is not None else None
                     except Exception:
                         continue
-                    off = _transect_offsets(line_utm, _to_utm(ref), transects)
-                    acc.setdefault(group, []).extend(off[np.isfinite(off)].tolist())
-                for group, vals in acc.items():
-                    arr = np.asarray(vals, dtype=float)
+                    off, multi = _transect_offsets(line_utm, _to_utm(ref), transects)
+                    bucket = acc.setdefault(group, {"off": [], "n_multi": 0})
+                    bucket["off"].extend(off[np.isfinite(off)].tolist())
+                    bucket["n_multi"] += int(multi.sum())
+                for group, bucket in acc.items():
+                    arr = np.asarray(bucket["off"], dtype=float)
                     if arr.size == 0:
                         continue
                     rows.append(
@@ -1782,6 +1810,7 @@ def benchmark_extraction(
                             "bias_m": float(np.mean(arr)),
                             "mae_m": float(np.mean(np.abs(arr))),
                             "n": int(arr.size),
+                            "n_multi_excluded": int(bucket["n_multi"]),
                         }
                     )
     return pd.DataFrame(rows)
@@ -1804,7 +1833,8 @@ def intersensor_bias(
 
     Returns:
         One row per sensor pair with ``mean_offset_m``, ``std_offset_m``,
-        ``median_offset_m``, ``n_pairs``, ``n_transect_samples``.
+        ``median_offset_m``, ``n_pairs``, ``n_transect_samples``, and
+        ``n_multi_excluded`` (transects dropped for a >1-crossing shoreline).
     """
     if transects is None:
         transects = load_transects()
@@ -1812,6 +1842,7 @@ def intersensor_bias(
     g["_t"] = pd.to_datetime(g["acq_datetime_utc"], utc=True)
     pairs: Dict[Tuple[str, str], List[float]] = {}
     pair_counts: Dict[Tuple[str, str], int] = {}
+    multi_counts: Dict[Tuple[str, str], int] = {}
     rows = list(g.iterrows())
     for i in range(len(rows)):
         _, a = rows[i]
@@ -1822,9 +1853,10 @@ def intersensor_bias(
             if abs((a["_t"] - b["_t"]).total_seconds()) > max_days * 86400:
                 continue
             key = tuple(sorted((str(a["sensor"]), str(b["sensor"]))))
-            off = _transect_offsets(_to_utm(a.geometry), _to_utm(b.geometry),
-                                    transects)
+            off, multi = _transect_offsets(_to_utm(a.geometry), _to_utm(b.geometry),
+                                           transects)
             finite = off[np.isfinite(off)]
+            multi_counts[key] = multi_counts.get(key, 0) + int(multi.sum())
             if finite.size == 0:
                 continue
             # Orient the offset consistently by the sorted-pair order.
@@ -1843,6 +1875,7 @@ def intersensor_bias(
                 "median_offset_m": float(np.median(arr)),
                 "n_pairs": pair_counts[key],
                 "n_transect_samples": int(arr.size),
+                "n_multi_excluded": multi_counts.get(key, 0),
             }
         )
     return pd.DataFrame(out)
