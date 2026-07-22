@@ -313,9 +313,16 @@ def build_scene_list_dense(
     unit as Series A. Reuses the Phase 1 AOI-reduced masking/reducers in
     ``src.data`` (``_prepare_landsat``/``_prepare_s2`` with ``all_season=True``,
     plus ``_aoi_pixel_count``/``_num_or_zero``) — it does NOT use scene-wide
-    ``CLOUDY_PIXEL_PERCENTAGE``/``CLOUD_COVER``. Per-scene AOI cloud % and
-    coverage % are evaluated in key chunks (``chunk`` per request) to stay under
-    the "Too many concurrent aggregations" (HTTP 429) limit.
+    ``CLOUDY_PIXEL_PERCENTAGE``/``CLOUD_COVER``.
+
+    The query runs **one calendar year at a time**: a single all-season query
+    across all ~27 years builds one enormous merged collection whose
+    ``aggregate_array(...).getInfo()`` trips GEE's "User memory limit exceeded".
+    A ``(sensor, date)`` group lies wholly within one calendar year, so the union
+    over years is identical to one query, but every request stays bounded.
+    Per-scene AOI cloud % and coverage % are still evaluated in key chunks
+    (``chunk`` per request) to stay under the concurrent-aggregation (HTTP 429)
+    limit.
 
     Scenes are kept when ``aoi_cloud_pct <= cloud_max_pct`` and
     ``aoi_coverage_pct >= coverage_min_pct`` (partial-coast scenes are retained —
@@ -331,80 +338,94 @@ def build_scene_list_dense(
 
     aoi = ee.Geometry.Polygon(config.aoi_coordinates())
     total_px = ee.Number(data._aoi_pixel_count(aoi, config.COVERAGE_SCALE))
-
-    prepared: List["ee.ImageCollection"] = []
-    for sensor in sensors:
-        if sensor == "S2":
-            prepared.append(data._prepare_s2(aoi, start, end, all_season=True))
-        else:
-            prepared.append(
-                data._prepare_landsat(
-                    _LANDSAT_COLLECTIONS[sensor], sensor, aoi, start, end,
-                    all_season=True,
-                )
-            )
-    if not prepared:
-        return pd.DataFrame()
-    merged = prepared[0]
-    for col in prepared[1:]:
-        merged = merged.merge(col)
-
-    keys: List[str] = merged.aggregate_array("sensor_date").distinct().getInfo()
     slc_millis = ee.Date(config.SLC_OFF_DATE).millis()
 
-    def _feature_for_key(key: "ee.String") -> "ee.Feature":
-        key = ee.String(key)
-        group = merged.filter(ee.Filter.eq("sensor_date", key))
-        mosaic = group.mosaic()
-        stats = mosaic.select(["cloudy", "valid"]).reduceRegion(
-            reducer=ee.Reducer.mean().combine(
-                reducer2=ee.Reducer.count(), sharedInputs=True
-            ),
-            geometry=aoi,
-            scale=config.COVERAGE_SCALE,
-            crs=config.METRIC_CRS,
-            maxPixels=int(1e10),
-            bestEffort=False,
-        )
-        cloud = data._num_or_zero(stats.get("cloudy_mean")).multiply(100)
-        coverage = (
-            data._num_or_zero(stats.get("valid_count"))
-            .divide(total_px)
-            .multiply(100)
-            .min(100.0)
-        )
-        parts = key.split("_")
-        sensor = ee.String(parts.get(0))
-        date = ee.String(parts.get(1))
-        image_ids = (
-            group.aggregate_array("system:index")
-            .map(lambda idx: data.clean_scene_id(ee.String(idx)))
-            .join(",")
-        )
-        is_slc_off = sensor.compareTo("L7").eq(0).And(
-            ee.Date(date).millis().gt(slc_millis)
-        )
-        return ee.Feature(
-            None,
-            {
-                "sensor": sensor,
-                "date": date,
-                "timestamp_utc": ee.Date(
-                    group.aggregate_min("system:time_start")
-                ).format(),
-                "image_ids": image_ids,
-                "n_scenes": group.size(),
-                "aoi_cloud_pct": cloud,
-                "aoi_coverage_pct": coverage,
-                "slc_off": is_slc_off,
-            },
-        )
+    def _prepared_for_window(win_start: str, win_end: str) -> Optional["ee.ImageCollection"]:
+        prepared: List["ee.ImageCollection"] = []
+        for sensor in sensors:
+            if sensor == "S2":
+                prepared.append(data._prepare_s2(aoi, win_start, win_end, all_season=True))
+            else:
+                prepared.append(
+                    data._prepare_landsat(
+                        _LANDSAT_COLLECTIONS[sensor], sensor, aoi, win_start, win_end,
+                        all_season=True,
+                    )
+                )
+        if not prepared:
+            return None
+        merged = prepared[0]
+        for col in prepared[1:]:
+            merged = merged.merge(col)
+        return merged
 
+    def _feature_for_key_fn(merged: "ee.ImageCollection"):
+        def _feature_for_key(key: "ee.String") -> "ee.Feature":
+            key = ee.String(key)
+            group = merged.filter(ee.Filter.eq("sensor_date", key))
+            mosaic = group.mosaic()
+            stats = mosaic.select(["cloudy", "valid"]).reduceRegion(
+                reducer=ee.Reducer.mean().combine(
+                    reducer2=ee.Reducer.count(), sharedInputs=True
+                ),
+                geometry=aoi,
+                scale=config.COVERAGE_SCALE,
+                crs=config.METRIC_CRS,
+                maxPixels=int(1e10),
+                bestEffort=False,
+            )
+            cloud = data._num_or_zero(stats.get("cloudy_mean")).multiply(100)
+            coverage = (
+                data._num_or_zero(stats.get("valid_count"))
+                .divide(total_px)
+                .multiply(100)
+                .min(100.0)
+            )
+            parts = key.split("_")
+            sensor = ee.String(parts.get(0))
+            date = ee.String(parts.get(1))
+            image_ids = (
+                group.aggregate_array("system:index")
+                .map(lambda idx: data.clean_scene_id(ee.String(idx)))
+                .join(",")
+            )
+            is_slc_off = sensor.compareTo("L7").eq(0).And(
+                ee.Date(date).millis().gt(slc_millis)
+            )
+            return ee.Feature(
+                None,
+                {
+                    "sensor": sensor,
+                    "date": date,
+                    "timestamp_utc": ee.Date(
+                        group.aggregate_min("system:time_start")
+                    ).format(),
+                    "image_ids": image_ids,
+                    "n_scenes": group.size(),
+                    "aoi_cloud_pct": cloud,
+                    "aoi_coverage_pct": coverage,
+                    "slc_off": is_slc_off,
+                },
+            )
+        return _feature_for_key
+
+    # Per-year windows whose union is exactly [start, end).
+    start_year, end_year = int(start[:4]), int(end[:4])
     records: List[dict] = []
-    for i in range(0, len(keys), chunk):
-        subset = ee.List(keys[i:i + chunk])
-        fc = ee.FeatureCollection(subset.map(_feature_for_key))
-        records.extend(f["properties"] for f in fc.getInfo()["features"])
+    for year in range(start_year, end_year + 1):
+        win_start = start if year == start_year else f"{year}-01-01"
+        win_end = end if year == end_year else f"{year + 1}-01-01"
+        merged = _prepared_for_window(win_start, win_end)
+        if merged is None:
+            continue
+        keys: List[str] = merged.aggregate_array("sensor_date").distinct().getInfo()
+        if not keys:
+            continue
+        feature_for_key = _feature_for_key_fn(merged)
+        for i in range(0, len(keys), chunk):
+            subset = ee.List(keys[i:i + chunk])
+            fc = ee.FeatureCollection(subset.map(feature_for_key))
+            records.extend(f["properties"] for f in fc.getInfo()["features"])
 
     rows: List[dict] = []
     for rec in records:
