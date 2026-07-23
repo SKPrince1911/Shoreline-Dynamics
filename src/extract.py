@@ -679,11 +679,14 @@ def fetch_scene(
       2. Reflectance: select ``config.BAND_MAP`` bands, download (bilinear) over
          the fixed grid, and scale to [0, 1] with ``config.SR_SCALE`` client-side
          (S2 20 m SWIR is bilinearly resampled to the 10 m grid on the way).
-      3. Mask (nearest): S2 -> Cloud Score+ ``cs < CS_THRESHOLD``; Landsat ->
-         ``QA_PIXEL`` bits 1/2/3/4 (dilated/cirrus/cloud/shadow), fill bit 0, and
-         ``QA_RADSAT`` saturation. When ``config.LANDSAT_CLOUD_MASK_ISSUE`` a
-         morphological opening drops isolated cloud flags over bright sand/surf
-         (CoastSat's ``cloud_mask_issue``).
+      3. Data presence (nearest): an explicit ``_obs`` band (1 where the SR
+         mosaic has data, 0 outside the footprint) marks observed pixels — NOT
+         QA bit 0, which reads 0 (= not fill) in the getDownloadURL no-data fill;
+         a belt-and-braces all-bands-raw-0 test backs it up. Cloud/shadow: S2 ->
+         Cloud Score+ ``cs < CS_THRESHOLD``; Landsat -> ``QA_PIXEL`` bits 1/2/3/4
+         (dilated/cirrus/cloud/shadow) + ``QA_RADSAT`` saturation. When
+         ``config.LANDSAT_CLOUD_MASK_ISSUE`` a morphological opening drops
+         isolated cloud flags over bright sand/surf (CoastSat's ``cloud_mask_issue``).
       4. ``georef_rmse_m`` from ``GEOMETRIC_RMSE_MODEL`` (Landsat) else the
          ``config.GEOREF_RMSE_DEFAULT_M`` fallback; ``acq_datetime_utc`` from
          ``system:time_start``.
@@ -732,13 +735,28 @@ def fetch_scene(
         b: refl_raw[b].astype(np.float32) * gain + offset for b in CANONICAL_BANDS
     }
 
-    # Mask source bands (nearest-neighbour download).
+    # Explicit data-presence band (D1 partial-coverage safety). getDownloadURL
+    # fills EVERY band — reflectance AND QA — with 0 outside a granule's
+    # footprint, so QA bit 0 (fill) reads as "not fill" and a no-data area would
+    # be marked valid with reflectance -0.2 (Landsat) or 0 (S2) -> MNDWI == 0
+    # exactly along the footprint edge -> a false straight shoreline that survives
+    # the min-length filter. This corrupts every partial-coverage product (the 19
+    # composites, 1991). So attach an explicit, sensor-agnostic presence band: 1
+    # where the SR mosaic has data, 0 outside. Built from the un-resampled
+    # reflectance mosaic's mask and downloaded nearest, so it is crisp 0/1.
+    presence = (
+        ee.ImageCollection(
+            [ee.Image(_ee_asset_id(g, sensor)).select([band_src[0]]) for g in granules]
+        )
+        .mosaic()
+        .mask()
+        .rename("_obs")
+    )
+
+    # Mask source bands (nearest-neighbour download), with _obs alongside.
     if sensor == "S2":
-        # Get Cloud Score+ 'cs' the Phase 1 way — a linkCollection join on
-        # system:index — not a hand-built asset ID. The join is robust to any
-        # index-format quirk (a wrong direct ID would silently yield an empty cs
-        # mosaic -> everything flagged not-observed -> an all-invalid, blank
-        # scene). Bound the scan to the acquisition day for speed.
+        # Cloud Score+ 'cs' via the Phase 1 linkCollection join (robust to any
+        # index-format quirk), bounded to the acquisition day for speed.
         day = ee.Date(date_from_image_id(granules[0]))
         cs_mosaic = (
             ee.ImageCollection(config.S2_SR_HARMONIZED)
@@ -748,35 +766,41 @@ def fetch_scene(
             .select("cs")
             .mosaic()
         )
-        cs = _download_tiled(
-            cs_mosaic, ["cs"], transform, width, height,
-            scale, tile_px=tile_px, keep_geom=region,
-        )["cs"]
-        observed = np.isfinite(cs)
-        cloud = observed & (cs < config.CS_THRESHOLD)
-        shadow = np.zeros_like(cloud)
-        saturated = np.zeros_like(cloud)
+        dl = _download_tiled(
+            ee.Image.cat([presence, cs_mosaic]), ["_obs", "cs"],
+            transform, width, height, scale, tile_px=tile_px, keep_geom=region,
+        )
+        # cs is filled with 0 outside the footprint; the _obs gate (below) handles
+        # that, so cloud is judged purely on cs where observed.
+        cloud = np.nan_to_num(dl["cs"], nan=0.0) < config.CS_THRESHOLD
+        shadow = np.zeros(cloud.shape, dtype=bool)
+        saturated = np.zeros(cloud.shape, dtype=bool)
     else:
         qa_imgs = [ee.Image(_ee_asset_id(g, sensor)).select(["QA_PIXEL", "QA_RADSAT"])
                    for g in granules]
-        qa = _download_tiled(
-            ee.ImageCollection(qa_imgs).mosaic(), ["QA_PIXEL", "QA_RADSAT"],
-            transform, width, height, scale, tile_px=tile_px,
-            keep_geom=region,
+        dl = _download_tiled(
+            ee.Image.cat([presence, ee.ImageCollection(qa_imgs).mosaic()]),
+            ["_obs", "QA_PIXEL", "QA_RADSAT"],
+            transform, width, height, scale, tile_px=tile_px, keep_geom=region,
         )
-        qap = np.nan_to_num(qa["QA_PIXEL"], nan=1.0).astype(np.uint16)
-        radsat = np.nan_to_num(qa["QA_RADSAT"], nan=1.0).astype(np.uint16)
-        fill = (qap & (1 << 0)) != 0
+        qap = np.nan_to_num(dl["QA_PIXEL"], nan=0.0).astype(np.uint16)
+        radsat = np.nan_to_num(dl["QA_RADSAT"], nan=0.0).astype(np.uint16)
         dilated = (qap & (1 << 1)) != 0
         cirrus = (qap & (1 << 2)) != 0
         cloud_bit = (qap & (1 << 3)) != 0
         shadow = (qap & (1 << 4)) != 0
         cloud = dilated | cirrus | cloud_bit
         saturated = radsat != 0
-        observed = ~fill
         if config.LANDSAT_CLOUD_MASK_ISSUE:
             # Drop small isolated cloud flags (bright beach/whitewater misflags).
             cloud = morphology.binary_opening(cloud, np.ones((3, 3), bool))
+
+    # Observed = explicit presence band (symmetric across sensors). Belt-and-
+    # braces: a pixel whose RAW reflectance is exactly 0 in ALL bands is no-data
+    # too (catches any residual fill the presence band missed).
+    observed = np.nan_to_num(dl["_obs"], nan=0.0) >= 0.5
+    all_zero = np.logical_and.reduce([refl_raw[b] == 0 for b in CANONICAL_BANDS])
+    observed = observed & ~all_zero
 
     valid = observed & ~cloud & ~shadow & ~saturated
     # Reflectance is only meaningful where valid.
