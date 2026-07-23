@@ -305,6 +305,7 @@ def build_scene_list_dense(
     coverage_min_pct: float = config.DENSE_COVERAGE_MIN_PCT,
     chunk: int = data._MATERIALIZE_BATCH_SIZE,
     write_csv: bool = True,
+    verbose: bool = True,
 ) -> pd.DataFrame:
     """Build the dense, all-season Series B scene list via GEE (D2).
 
@@ -327,6 +328,10 @@ def build_scene_list_dense(
     Scenes are kept when ``aoi_cloud_pct <= cloud_max_pct`` and
     ``aoi_coverage_pct >= coverage_min_pct`` (partial-coast scenes are retained —
     they still constrain the slope estimate at the transects they cover).
+
+    With ``verbose`` (default ``True``) a progress line is printed per year
+    (``"YYYY: k kept of n evaluated | running total …"``) so the multi-minute
+    build can be watched advancing.
 
     Returns:
         A DataFrame in the shared scene-list schema with ``series='B'`` (and a
@@ -409,48 +414,57 @@ def build_scene_list_dense(
             )
         return _feature_for_key
 
-    # Per-year windows whose union is exactly [start, end).
+    # Per-year windows whose union is exactly [start, end). Filtering and the
+    # ``verbose`` progress line ("YYYY: k kept of n | running total …") happen
+    # per year so a long dense build (tens of minutes to a couple of hours) can
+    # be watched advancing rather than sitting silent.
     start_year, end_year = int(start[:4]), int(end[:4])
-    records: List[dict] = []
+    rows: List[dict] = []
     for year in range(start_year, end_year + 1):
         win_start = start if year == start_year else f"{year}-01-01"
         win_end = end if year == end_year else f"{year + 1}-01-01"
         merged = _prepared_for_window(win_start, win_end)
-        if merged is None:
-            continue
-        keys: List[str] = merged.aggregate_array("sensor_date").distinct().getInfo()
-        if not keys:
-            continue
-        feature_for_key = _feature_for_key_fn(merged)
-        for i in range(0, len(keys), chunk):
-            subset = ee.List(keys[i:i + chunk])
-            fc = ee.FeatureCollection(subset.map(feature_for_key))
-            records.extend(f["properties"] for f in fc.getInfo()["features"])
-
-    rows: List[dict] = []
-    for rec in records:
-        if rec["aoi_cloud_pct"] > cloud_max_pct:
-            continue
-        if rec["aoi_coverage_pct"] < coverage_min_pct:
-            continue
-        ts = _parse_utc(rec["timestamp_utc"])
-        dry_year = assign_dry_year(ts)
-        rows.append(
-            {
-                "image_id": rec["image_ids"],
-                "sensor": rec["sensor"],
-                "acq_datetime_utc": ts,
-                "dry_year": dry_year,
-                "season_label": data.season_label(dry_year),
-                "series": "B",
-                "aoi_cloud_pct": float(rec["aoi_cloud_pct"]),
-                "aoi_coverage_pct": float(rec["aoi_coverage_pct"]),
-                "slc_off": bool(rec["slc_off"]),
-                # Each dense scene is a single acquisition -> no composite spread.
-                "composite_date_spread_days": 0,
-                "georef_rmse_m": np.nan,
-            }
+        keys: List[str] = (
+            merged.aggregate_array("sensor_date").distinct().getInfo()
+            if merged is not None else []
         )
+        year_records: List[dict] = []
+        if keys:
+            feature_for_key = _feature_for_key_fn(merged)
+            for i in range(0, len(keys), chunk):
+                subset = ee.List(keys[i:i + chunk])
+                fc = ee.FeatureCollection(subset.map(feature_for_key))
+                year_records.extend(f["properties"] for f in fc.getInfo()["features"])
+
+        kept = 0
+        for rec in year_records:
+            if rec["aoi_cloud_pct"] > cloud_max_pct:
+                continue
+            if rec["aoi_coverage_pct"] < coverage_min_pct:
+                continue
+            ts = _parse_utc(rec["timestamp_utc"])
+            dry_year = assign_dry_year(ts)
+            rows.append(
+                {
+                    "image_id": rec["image_ids"],
+                    "sensor": rec["sensor"],
+                    "acq_datetime_utc": ts,
+                    "dry_year": dry_year,
+                    "season_label": data.season_label(dry_year),
+                    "series": "B",
+                    "aoi_cloud_pct": float(rec["aoi_cloud_pct"]),
+                    "aoi_coverage_pct": float(rec["aoi_coverage_pct"]),
+                    "slc_off": bool(rec["slc_off"]),
+                    # Each dense scene is a single acquisition -> no composite spread.
+                    "composite_date_spread_days": 0,
+                    "georef_rmse_m": np.nan,
+                }
+            )
+            kept += 1
+        if verbose:
+            print(f"{year}: {kept} kept of {len(year_records)} evaluated "
+                  f"| running total {len(rows)}", flush=True)
+
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values(["acq_datetime_utc", "sensor"]).reset_index(drop=True)
@@ -685,10 +699,22 @@ def fetch_scene(
 
     # Mask source bands (nearest-neighbour download).
     if sensor == "S2":
-        cs_imgs = [ee.Image(f"{config.CLOUD_SCORE_PLUS}/{g}").select("cs")
-                   for g in granules]
+        # Get Cloud Score+ 'cs' the Phase 1 way — a linkCollection join on
+        # system:index — not a hand-built asset ID. The join is robust to any
+        # index-format quirk (a wrong direct ID would silently yield an empty cs
+        # mosaic -> everything flagged not-observed -> an all-invalid, blank
+        # scene). Bound the scan to the acquisition day for speed.
+        day = ee.Date(date_from_image_id(granules[0]))
+        cs_mosaic = (
+            ee.ImageCollection(config.S2_SR_HARMONIZED)
+            .filterDate(day, day.advance(1, "day"))
+            .filter(ee.Filter.inList("system:index", ee.List(granules)))
+            .linkCollection(ee.ImageCollection(config.CLOUD_SCORE_PLUS), ["cs"])
+            .select("cs")
+            .mosaic()
+        )
         cs = _download_tiled(
-            ee.ImageCollection(cs_imgs).mosaic(), ["cs"], transform, width, height,
+            cs_mosaic, ["cs"], transform, width, height,
             scale, resample=False, tile_px=tile_px, keep_geom=region,
         )["cs"]
         observed = np.isfinite(cs)
