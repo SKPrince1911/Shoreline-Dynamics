@@ -32,9 +32,16 @@ pixel-aligned — required for the inter-sensor bias test and the benchmark).
 from __future__ import annotations
 
 import csv
+import logging
 import math
 import os
 import urllib.request
+
+# EE's downloaded GeoTIFF tiles carry a band count that doesn't match a colour
+# interpretation, so GDAL/rasterio logs a harmless "Sum of Photometric ... and
+# ExtraSamples doesn't match SamplesPerPixel" warning per tile. Quiet that noise
+# without hiding real errors.
+logging.getLogger("rasterio._env").setLevel(logging.ERROR)
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -577,24 +584,24 @@ def _download_tiled(
     width: int,
     height: int,
     scale: int,
-    resample: bool,
     tile_px: int = DEFAULT_TILE_PX,
     keep_geom: Optional[Polygon] = None,
 ) -> Dict[str, np.ndarray]:
     """Fetch an ``ee.Image`` onto the fixed grid, tile by tile, as NumPy arrays.
 
     The AOI is ~90 km long, so a single ``getDownloadURL`` exceeds GEE's payload
-    limit; the grid is fetched in ``tile_px`` blocks and stitched. ``resample``
-    selects bilinear (reflectance) vs nearest (integer QA bit-masks — bilinear
-    would corrupt the flags). Tiles whose footprint does not intersect
-    ``keep_geom`` (the search-zone/extraction polygon, EPSG:32646) are skipped
-    and left NaN — the fetch grid is the bbox of an irregular coastal band, so
-    this avoids downloading (and holding in RAM) the empty corner tiles.
+    limit; the grid is fetched in ``tile_px`` blocks and stitched. Any bilinear
+    resampling of reflectance must be applied to the SOURCE images (which carry a
+    native projection) BEFORE they are mosaicked — never here: ``.resample()`` on
+    a ``mosaic()`` (whose default projection is EPSG:4326 at 1°) makes GEE compute
+    at ~1° and upsample, collapsing the whole scene to a near-constant blur. Tiles
+    whose footprint does not intersect ``keep_geom`` (the search-zone/extraction
+    polygon, EPSG:32646) are skipped and left NaN — the fetch grid is the bbox of
+    an irregular coastal band, so this avoids downloading (and holding in RAM) the
+    empty corner tiles.
 
     Returns a dict of ``band_name -> (height, width) float32`` arrays.
     """
-    if resample:
-        image = image.resample("bilinear")
     x0, y1 = transform.c, transform.f
     out = {b: np.full((height, width), np.nan, dtype=np.float32) for b in band_names}
     for r0 in range(0, height, tile_px):
@@ -685,12 +692,18 @@ def fetch_scene(
     transform, width, height = _fixed_grid(minx, miny, maxx, maxy, scale)
 
     band_src = [config.BAND_MAP[sensor][b] for b in CANONICAL_BANDS]
-    refl_imgs = [ee.Image(_ee_asset_id(g, sensor)).select(band_src, CANONICAL_BANDS)
-                 for g in granules]
+    # Resample each SOURCE image (native projection intact) so S2 20 m SWIR is
+    # bilinearly brought to the 10 m grid and reflectance interpolates cleanly.
+    # Resampling here — not on the mosaic — avoids the 1° collapse bug.
+    refl_imgs = [
+        ee.Image(_ee_asset_id(g, sensor)).select(band_src, CANONICAL_BANDS)
+        .resample("bilinear")
+        for g in granules
+    ]
     refl_image = ee.ImageCollection(refl_imgs).mosaic()
     refl_raw = _download_tiled(
         refl_image, CANONICAL_BANDS, transform, width, height, scale,
-        resample=True, tile_px=tile_px, keep_geom=region,
+        tile_px=tile_px, keep_geom=region,
     )
     gain, offset = config.SR_SCALE[family]
     bands: Dict[str, np.ndarray] = {
@@ -715,7 +728,7 @@ def fetch_scene(
         )
         cs = _download_tiled(
             cs_mosaic, ["cs"], transform, width, height,
-            scale, resample=False, tile_px=tile_px, keep_geom=region,
+            scale, tile_px=tile_px, keep_geom=region,
         )["cs"]
         observed = np.isfinite(cs)
         cloud = observed & (cs < config.CS_THRESHOLD)
@@ -726,7 +739,7 @@ def fetch_scene(
                    for g in granules]
         qa = _download_tiled(
             ee.ImageCollection(qa_imgs).mosaic(), ["QA_PIXEL", "QA_RADSAT"],
-            transform, width, height, scale, resample=False, tile_px=tile_px,
+            transform, width, height, scale, tile_px=tile_px,
             keep_geom=region,
         )
         qap = np.nan_to_num(qa["QA_PIXEL"], nan=1.0).astype(np.uint16)
@@ -741,7 +754,7 @@ def fetch_scene(
         observed = ~fill
         if config.LANDSAT_CLOUD_MASK_ISSUE:
             # Drop small isolated cloud flags (bright beach/whitewater misflags).
-            cloud = morphology.binary_opening(cloud, morphology.square(3))
+            cloud = morphology.binary_opening(cloud, np.ones((3, 3), bool))
 
     valid = observed & ~cloud & ~shadow & ~saturated
     # Reflectance is only meaningful where valid.
@@ -1236,7 +1249,7 @@ def extract_contour(
         return []
     fill = float(np.median(arr[good]))
     arr = np.where(good, arr, fill)
-    invalid_dil = morphology.binary_dilation(~good, morphology.square(3))
+    invalid_dil = morphology.binary_dilation(~good, np.ones((3, 3), bool))
     height, width = arr.shape
 
     lines: List[LineString] = []
