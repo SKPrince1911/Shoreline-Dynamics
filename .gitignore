@@ -10,6 +10,12 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Scene GeoTIFF exports (export_scene_geotiff) — large per-scene rasters written
+# to Drive, or to outputs/ when Drive isn't mounted. NEVER commit these: they
+# would otherwise be swept in by save_outputs()'s `git add outputs`.
+*.tif
+*.tiff
+
 # NOTE: outputs/ and models/ are intentionally NOT ignored — the generated
 # CSVs, GeoJSONs, and trained classifiers under them are Phase 2/3 deliverables
 # that save_outputs() commits and pushes to GitHub.

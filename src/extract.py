@@ -780,11 +780,21 @@ def fetch_scene(
 
 
 def _read_georef_rmse(meta_img: "ee.Image", family: str) -> float:
-    """Per-scene georeferencing RMSE (m) from metadata, else the fallback (D5)."""
+    """Per-scene georeferencing RMSE (m) from metadata, else the fallback (D5).
+
+    Landsat Collection 2 publishes a per-scene numeric ``GEOMETRIC_RMSE_MODEL``
+    (metres), read here. Sentinel-2 (COPERNICUS/S2_SR_HARMONIZED) exposes NO
+    per-scene numeric geolocation RMSE — its only geometric-quality property is a
+    categorical ``GEOMETRIC_QUALITY`` PASSED/FAILED flag, and the ~11 m S2
+    geolocation accuracy is characterised globally, not per scene. So E_georef is
+    a per-scene MEASUREMENT for Landsat but a fixed ASSUMPTION for Sentinel-2
+    (``config.GEOREF_RMSE_DEFAULT_M['S2']``); Phase 4 must report it as such.
+    """
     import ee
 
     fallback = config.GEOREF_RMSE_DEFAULT_M[family]
     if family != "LANDSAT":
+        # Sentinel-2: no per-scene geolocation RMSE field exists in GEE -> constant.
         return float(fallback)
     try:
         value = ee.Image(meta_img).get("GEOMETRIC_RMSE_MODEL").getInfo()

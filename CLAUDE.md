@@ -83,7 +83,13 @@ Phase 1 inventory (18 single / 19 composite / 1 partial / 3 gap).
   pending the benchmark. (AWEInsh needs SWIR2, so `swir2` is carried on every
   fetched scene — see config BAND_MAP.)
 - **D5 — per-scene georeferencing RMSE is read from image metadata**, not
-  assumed constant, and feeds the per-shoreline uncertainty budget.
+  assumed constant, and feeds the per-shoreline uncertainty budget. This holds
+  for Landsat (Collection 2 `GEOMETRIC_RMSE_MODEL`, metres per scene). Sentinel-2
+  (`S2_SR_HARMONIZED`) has NO per-scene numeric geolocation RMSE in GEE (only a
+  categorical `GEOMETRIC_QUALITY` PASSED/FAILED flag), so it falls back to the
+  constant `config.GEOREF_RMSE_DEFAULT_M['S2']` (~11 m). Hence E_georef is a
+  per-scene MEASUREMENT for Landsat but a fixed ASSUMPTION for Sentinel-2, and
+  Phase 4 must state the S2 term as an assumption, not a measurement.
 - **D6 — inter-sensor bias quantification is a Phase 2 deliverable** (e.g. at
   sensor-overlap dates on pixel-aligned grids), so cross-sensor offsets are
   characterised before rates are computed.
