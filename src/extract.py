@@ -132,9 +132,9 @@ TRANSECT_LENGTH_M: float = 1500.0    # <-- TUNABLE (seaward reach from the basel
 OUTPUT_SCHEMA: List[str] = [
     "image_id", "sensor", "sensor_group", "acq_datetime_utc", "dry_year",
     "season_label", "series", "pixel_size_m", "georef_rmse_m", "aoi_cloud_pct",
-    "aoi_coverage_pct", "slc_off", "composite_date_spread_days", "water_index",
-    "threshold_method", "threshold_value", "classifier_version", "length_m",
-    "n_vertices", "pct_aoi_alongshore_covered", "flags",
+    "aoi_coverage_pct", "slc_off", "composite_date_spread_days", "season_complete",
+    "water_index", "threshold_method", "threshold_value", "classifier_version",
+    "length_m", "n_vertices", "pct_aoi_alongshore_covered", "flags",
 ]
 
 # Reusable CRS transformers (EPSG:4326 <-> EPSG:32646, always lon/lat order).
@@ -204,6 +204,23 @@ def assign_dry_year(when: datetime) -> int:
     acquisitions this equals the Phase 1 ``dry_year`` exactly.
     """
     return when.year + 1 if when.month >= 11 else when.year
+
+
+def _season_complete(
+    dry_year: int, query_start: pd.Timestamp, query_end: pd.Timestamp
+) -> bool:
+    """Whether a dry-season-year's full all-season window fits the query range.
+
+    A Series B ``dry_year`` spans Nov (Y−1) → Oct (Y). It is 'complete' only if
+    that whole window lies within ``[query_start, query_end]``. Boundary years are
+    incomplete: 1999 (its Nov–Dec 1998 head predates ``DENSE_START``) and the
+    trailing year (its monsoon tail postdates ``DENSE_END``). Incomplete years
+    must be excluded from any per-dry_year seasonal statistic — the flag makes
+    that impossible to miss.
+    """
+    win_start = pd.Timestamp(f"{dry_year - 1}-11-01")
+    win_end = pd.Timestamp(f"{dry_year}-10-31")
+    return bool(win_start >= query_start and win_end <= query_end)
 
 
 def _class_code(name: str) -> int:
@@ -293,6 +310,9 @@ def build_scene_list_annual(
                     "aoi_coverage_pct": _to_float(r.get("achieved_coverage_pct")),
                     "slc_off": bool(data.slc_off(sensor, date)),
                     "composite_date_spread_days": spread_days,
+                    # Series A products are deliberate per-year dry-season products,
+                    # each temporally its own year -> always season-complete.
+                    "season_complete": True,
                     "georef_rmse_m": np.nan,
                     "product_type": r.get("product_type"),
                     "review_status": r.get("review_status"),
@@ -425,6 +445,7 @@ def build_scene_list_dense(
     # ``verbose`` progress line ("YYYY: k kept of n | running total …") happen
     # per year so a long dense build (tens of minutes to a couple of hours) can
     # be watched advancing rather than sitting silent.
+    q_start, q_end = pd.Timestamp(start), pd.Timestamp(end)
     start_year, end_year = int(start[:4]), int(end[:4])
     rows: List[dict] = []
     for year in range(start_year, end_year + 1):
@@ -464,6 +485,7 @@ def build_scene_list_dense(
                     "slc_off": bool(rec["slc_off"]),
                     # Each dense scene is a single acquisition -> no composite spread.
                     "composite_date_spread_days": 0,
+                    "season_complete": _season_complete(dry_year, q_start, q_end),
                     "georef_rmse_m": np.nan,
                 }
             )
@@ -1461,6 +1483,7 @@ def _attach_row_metadata(scene: Scene, row: pd.Series) -> Scene:
     scene._composite_date_spread_days = _to_float(
         row.get("composite_date_spread_days", 0)
     )
+    scene._season_complete = bool(row.get("season_complete", True))
     return scene
 
 
@@ -1515,6 +1538,7 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         "aoi_coverage_pct": getattr(scene, "_aoi_coverage_pct", None),
         "slc_off": bool(getattr(scene, "_slc_off", False)),
         "composite_date_spread_days": spread_days,
+        "season_complete": bool(getattr(scene, "_season_complete", True)),
         "water_index": settings["water_index"],
         "threshold_method": settings["threshold_method"],
         "threshold_value": float(threshold),
@@ -1648,8 +1672,8 @@ def merge_annual(gdf: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame":
     keep = [
         "dry_year", "season_label", "source_image_id", "source_acq_datetime_utc",
         "sensor", "sensor_group", "series", "composite_date_spread_days",
-        "water_index", "threshold_method", "threshold_value", "georef_rmse_m",
-        "length_m", "flags", "geometry",
+        "season_complete", "water_index", "threshold_method", "threshold_value",
+        "georef_rmse_m", "length_m", "flags", "geometry",
     ]
     cols = [c for c in keep if c in series_a.columns]
     out = series_a[cols].sort_values(["dry_year", "source_acq_datetime_utc"])

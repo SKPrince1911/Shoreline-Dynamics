@@ -275,9 +275,14 @@ SEARCH_ZONE_PATH: str = "data/shoreline_search_zone.geojson"
 # RSS budget (~ local change rate x spread/2).  <-- TUNABLE
 COMPOSITE_SPREAD_FLAG_DAYS: float = 60.0
 
-# Series B (dense, all-season 1999-2025) query envelope (D2).  <-- TUNABLE
+# Series B (dense, all-season) query envelope (D2).  <-- TUNABLE
+# End at 2026-04-30 (not 2025-12-31) so the COMPLETE 2025-2026 dry season
+# (Nov 2025 - Mar 2026) is captured for slope density. A Series B dry_year spans
+# Nov(Y-1)-Oct(Y), so the boundary years 1999 (missing its Nov-Dec 1998 head) and
+# 2026 (missing its 2026 monsoon tail) are all-season-incomplete; they are marked
+# season_complete=False so no per-dry_year seasonal statistic uses a partial year.
 DENSE_START: str = "1999-01-01"
-DENSE_END: str = "2025-12-31"
+DENSE_END: str = "2026-04-30"
 DENSE_SENSORS: List[str] = ["L7", "L8", "L9", "S2"]
 DENSE_CLOUD_MAX_PCT: float = 30.0     # relaxed vs the 10% annual rule
 DENSE_COVERAGE_MIN_PCT: float = 50.0  # partial scenes are still useful for slope

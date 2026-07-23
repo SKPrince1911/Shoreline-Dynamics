@@ -68,10 +68,17 @@ Phase 1 inventory (18 single / 19 composite / 1 partial / 3 gap).
   uncorrectable in Phase 3 (FES2022 tidal correction is per acquisition time).
 - **D2 — two shoreline series.**
   - Series A = the 38 annual dry-season products (the trend layer).
-  - Series B = a dense, all-season series, 1999–2025, from L7/L8/L9/S2. It is
-    required for CoastSat.slope, which needs sub-monthly sampling: a 365-day
-    annual series aliases the tidal band entirely, so beach-slope estimation is
-    impossible from Series A alone.
+  - Series B = a dense, all-season series from L7/L8/L9/S2, required for
+    CoastSat.slope (sub-monthly sampling: a 365-day annual series aliases the
+    tidal band entirely). Query envelope `DENSE_START`..`DENSE_END` =
+    1999-01-01..2026-04-30 — extended past 2025 so the COMPLETE 2025-2026 dry
+    season (Nov 2025–Mar 2026) is captured for slope density. A Series B
+    `dry_year` spans Nov(Y-1)–Oct(Y), so the boundary years 1999 (missing its
+    Nov–Dec 1998 head) and 2026 (missing its 2026 monsoon tail) are
+    all-season-INCOMPLETE and carry `season_complete=False` on the scene list and
+    every shoreline record; any per-`dry_year` seasonal statistic MUST exclude
+    incomplete years. This is the slope/dense layer only — the reported study
+    period stays 1988–2025.
 - **D3 — surface reflectance + a LOCAL classifier.**
   Keep SR imagery (`S2_SR_HARMONIZED` + Landsat C2 L2). Train a local
   sand/water/whitewater/other classifier in THREE sensor groups by band layout:
