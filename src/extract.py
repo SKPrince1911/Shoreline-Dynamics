@@ -679,7 +679,7 @@ def fetch_scene(
       2. Reflectance: select ``config.BAND_MAP`` bands, download (bilinear) over
          the fixed grid, and scale to [0, 1] with ``config.SR_SCALE`` client-side
          (S2 20 m SWIR is bilinearly resampled to the 10 m grid on the way).
-      3. Data presence (nearest): an explicit ``_obs`` band (1 where the SR
+      3. Data presence (nearest): an explicit ``obs_mask`` band (1 where the SR
          mosaic has data, 0 outside the footprint) marks observed pixels — NOT
          QA bit 0, which reads 0 (= not fill) in the getDownloadURL no-data fill;
          a belt-and-braces all-bands-raw-0 test backs it up. Cloud/shadow: S2 ->
@@ -750,10 +750,10 @@ def fetch_scene(
         )
         .mosaic()
         .mask()
-        .rename("_obs")
+        .rename("obs_mask")
     )
 
-    # Mask source bands (nearest-neighbour download), with _obs alongside.
+    # Mask source bands (nearest-neighbour download), with obs_mask alongside.
     if sensor == "S2":
         # Cloud Score+ 'cs' via the Phase 1 linkCollection join (robust to any
         # index-format quirk), bounded to the acquisition day for speed.
@@ -767,10 +767,10 @@ def fetch_scene(
             .mosaic()
         )
         dl = _download_tiled(
-            ee.Image.cat([presence, cs_mosaic]), ["_obs", "cs"],
+            ee.Image.cat([presence, cs_mosaic]), ["obs_mask", "cs"],
             transform, width, height, scale, tile_px=tile_px, keep_geom=region,
         )
-        # cs is filled with 0 outside the footprint; the _obs gate (below) handles
+        # cs is filled with 0 outside the footprint; the obs_mask gate (below) handles
         # that, so cloud is judged purely on cs where observed.
         cloud = np.nan_to_num(dl["cs"], nan=0.0) < config.CS_THRESHOLD
         shadow = np.zeros(cloud.shape, dtype=bool)
@@ -780,7 +780,7 @@ def fetch_scene(
                    for g in granules]
         dl = _download_tiled(
             ee.Image.cat([presence, ee.ImageCollection(qa_imgs).mosaic()]),
-            ["_obs", "QA_PIXEL", "QA_RADSAT"],
+            ["obs_mask", "QA_PIXEL", "QA_RADSAT"],
             transform, width, height, scale, tile_px=tile_px, keep_geom=region,
         )
         qap = np.nan_to_num(dl["QA_PIXEL"], nan=0.0).astype(np.uint16)
@@ -798,7 +798,7 @@ def fetch_scene(
     # Observed = explicit presence band (symmetric across sensors). Belt-and-
     # braces: a pixel whose RAW reflectance is exactly 0 in ALL bands is no-data
     # too (catches any residual fill the presence band missed).
-    observed = np.nan_to_num(dl["_obs"], nan=0.0) >= 0.5
+    observed = np.nan_to_num(dl["obs_mask"], nan=0.0) >= 0.5
     all_zero = np.logical_and.reduce([refl_raw[b] == 0 for b in CANONICAL_BANDS])
     observed = observed & ~all_zero
 
