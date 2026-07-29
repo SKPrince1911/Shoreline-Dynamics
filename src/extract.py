@@ -53,7 +53,7 @@ import geopandas as gpd
 import pyproj
 import rasterio
 from shapely.geometry import (
-    LineString, MultiLineString, Polygon, box, mapping,
+    LineString, MultiLineString, Point, Polygon, box, mapping,
 )
 from shapely.ops import linemerge, transform as shapely_transform, unary_union
 from rasterio import features as rio_features
@@ -134,7 +134,8 @@ OUTPUT_SCHEMA: List[str] = [
     "season_label", "series", "pixel_size_m", "georef_rmse_m", "aoi_cloud_pct",
     "aoi_coverage_pct", "slc_off", "composite_date_spread_days", "season_complete",
     "water_index", "threshold_method", "threshold_value", "classifier_version",
-    "length_m", "n_vertices", "pct_aoi_alongshore_covered", "flags",
+    "length_m", "n_vertices", "pct_aoi_alongshore_covered",
+    "envelope_n_multi", "seaward_methods", "flags",
 ]
 
 # Reusable CRS transformers (EPSG:4326 <-> EPSG:32646, always lon/lat order).
@@ -154,6 +155,21 @@ def _to_utm(geom):
 def _to_wgs(geom):
     """Reproject a shapely geometry EPSG:32646 -> EPSG:4326 (for storage)."""
     return shapely_transform(_TF_UTM_TO_WGS.transform, geom)
+
+
+def _seaward_reference_utm() -> Optional[Point]:
+    """The configured offshore reference point in EPSG:32646, or ``None``.
+
+    ``config.SEAWARD_REFERENCE_LONLAT`` is a (lon, lat) point well offshore in the
+    Bay of Bengal. It orients transects at build time and is the fallback seaward
+    reference when the per-scene water mask can't resolve a transect's seaward end.
+    Returns ``None`` (and callers fall back to ``LAND_IS_EAST``) when it is unset.
+    """
+    ref = getattr(config, "SEAWARD_REFERENCE_LONLAT", None)
+    if not ref:
+        return None
+    lon, lat = float(ref[0]), float(ref[1])
+    return _to_utm(Point(lon, lat))
 
 
 # ---------------------------------------------------------------------------
@@ -1392,6 +1408,10 @@ def filter_contours(
     search_zone: Optional[Polygon],
     channel_lines: List[LineString],
     min_length_m: float = config.MIN_SHORELINE_LENGTH_M,
+    mode: Optional[str] = None,
+    transects: Optional["gpd.GeoDataFrame"] = None,
+    watermask: Optional[Tuple[np.ndarray, Affine]] = None,
+    audit: Optional[dict] = None,
 ):
     """Reduce raw contours to a single ordered shoreline geometry.
 
@@ -1411,10 +1431,28 @@ def filter_contours(
        only — real inter-channel reaches survive).
     5. Order alongshore (north -> south).
 
+    ``mode`` (default ``config.SHORELINE_MODE``):
+
+    * ``"raw"`` returns the merged geometry from steps 1–5 exactly (bit-for-bit,
+      for benchmark comparison).
+    * ``"envelope"`` additionally drops small closed loops and reduces to the
+      seaward-most land/water boundary along ``transects`` (:func:`seaward_envelope`),
+      which drops channel intrusions / lagoons / behind-beach ponds year-
+      agnostically — closure lines become non-essential (mouths without a closure
+      are still handled). If ``transects`` is None (no baseline yet), it silently
+      returns the raw geometry; the one-line note is emitted by
+      :func:`default_settings`.
+
+    ``watermask`` is the per-scene ``(labels, transform)`` used to resolve each
+    transect's seaward direction (envelope only). ``audit`` — when a dict is passed
+    — is populated in envelope mode with ``envelope_n_multi`` and ``seaward_methods``
+    (the :func:`seaward_envelope` diagnostics) so the caller can record them.
+
     Returns:
         A ``LineString``/``MultiLineString`` (EPSG:32646), or ``None`` if nothing
         survives.
     """
+    mode = mode or config.SHORELINE_MODE
     lines = [ln for ln in contours if ln is not None and ln.length > 0]
     if not lines:
         return None
@@ -1433,9 +1471,211 @@ def filter_contours(
     if not ordered:
         return None
     ordered.sort(key=lambda ln: ln.centroid.y, reverse=True)  # north (higher y) first
-    if len(ordered) == 1:
-        return ordered[0]
-    return MultiLineString(ordered)
+    merged_geom = ordered[0] if len(ordered) == 1 else MultiLineString(ordered)
+
+    if mode == "envelope" and transects is not None:
+        env, n_multi, methods = seaward_envelope(
+            merged_geom, transects, watermask=watermask
+        )
+        if audit is not None:
+            audit["envelope_n_multi"] = n_multi
+            audit["seaward_methods"] = methods
+        return env if env is not None else merged_geom
+    return merged_geom  # raw (or envelope with no transects) — bit-for-bit
+
+
+def _is_small_loop(ln: LineString, max_area_m2: float, tol_m: float = 1.0) -> bool:
+    """Whether ``ln`` is a CLOSED loop whose enclosed area is below ``max_area_m2``.
+
+    Open lines and large loops return ``False`` (kept). Used to drop behind-beach
+    ponds/lagoons while keeping islands and big recurved spits.
+    """
+    coords = list(ln.coords)
+    if len(coords) < 4:
+        return False
+    if Point(coords[0]).distance(Point(coords[-1])) > tol_m:
+        return False  # open line
+    poly = Polygon(coords)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    return poly.area < max_area_m2
+
+
+def _drop_small_loops(lines: List[LineString], max_area_m2: float) -> List[LineString]:
+    """Drop small closed loops (keep open lines and large loops)."""
+    return [ln for ln in lines if not _is_small_loop(ln, max_area_m2)]
+
+
+def _label_at(pt: Point, transform: Affine, labels: np.ndarray) -> Optional[int]:
+    """Sample the classifier label at a UTM point, or ``None`` if off-grid.
+
+    Inverts the scene affine (``~transform``) to map the EPSG:32646 point to a
+    (row, col) pixel index; returns the integer class code there, or ``None`` when
+    the point falls outside the label grid.
+    """
+    col, row = (~transform) * (pt.x, pt.y)
+    r, c = int(round(row)), int(round(col))
+    h, w = labels.shape
+    if 0 <= r < h and 0 <= c < w:
+        return int(labels[r, c])
+    return None
+
+
+def _inset_point(end: Point, other: Point, inset_m: float) -> Point:
+    """A point ``inset_m`` in from ``end`` toward ``other`` (i.e. just inside).
+
+    Sampling the label a short distance in from a transect endpoint (rather than
+    exactly at it) avoids the sub-pixel edge and any no-data ring at the very tip.
+    """
+    dx, dy = (other.x - end.x), (other.y - end.y)
+    d = math.hypot(dx, dy) or 1.0
+    f = min(inset_m, d) / d
+    return Point(end.x + dx * f, end.y + dy * f)
+
+
+def _resolve_seaward(
+    tr: LineString,
+    labels: Optional[np.ndarray],
+    transform: Optional[Affine],
+    ref_utm: Optional[Point],
+    inset_m: float = 30.0,
+) -> Tuple[Point, Point, str]:
+    """Decide which end of a transect is seaward (robust off the west-facing coast).
+
+    Priority (each transect is resolved by exactly one, and the method is reported
+    so robustness at the southern hook — Teknaf, Shah Porir Dwip, where the coast
+    does NOT face west — is auditable):
+
+    1. ``"watermask"`` (primary) — sample the per-scene classifier label a short
+       distance in from each end; the end sitting on WATER (and only that end) is
+       seaward. Ambiguous when both or neither end reads water (channel mouths,
+       lagoons behind a spit) -> fall through.
+    2. ``"offshore_ref"`` (fallback) — the endpoint nearer
+       ``config.SEAWARD_REFERENCE_LONLAT`` (a point well offshore in the Bay) is
+       seaward. Used when the water mask is ambiguous or unavailable.
+    3. ``"land_is_east"`` (last resort) — with no reference configured, the coast's
+       land-east / sea-west default picks the smaller-easting endpoint as seaward.
+
+    Returns:
+        ``(seaward_end, landward_end, method)`` — the two endpoints of ``tr`` in the
+        resolved land->sea order, plus the method label.
+    """
+    end0 = Point(tr.coords[0])
+    end1 = Point(tr.coords[-1])
+
+    # 1. Water mask — sample a short distance in from each end.
+    if labels is not None and transform is not None:
+        l0 = _label_at(_inset_point(end0, end1, inset_m), transform, labels)
+        l1 = _label_at(_inset_point(end1, end0, inset_m), transform, labels)
+        w0 = l0 == config.CLASS_WATER
+        w1 = l1 == config.CLASS_WATER
+        if w0 != w1:  # exactly one end is water -> unambiguous
+            return (end0, end1, "watermask") if w0 else (end1, end0, "watermask")
+
+    # 2. Offshore reference — the end nearer the Bay-of-Bengal point is seaward.
+    if ref_utm is not None:
+        if ref_utm.distance(end0) <= ref_utm.distance(end1):
+            return end0, end1, "offshore_ref"
+        return end1, end0, "offshore_ref"
+
+    # 3. Last resort — land east, sea west: the smaller-easting end is seaward.
+    if LAND_IS_EAST:
+        return (end0, end1, "land_is_east") if end0.x <= end1.x else (end1, end0, "land_is_east")
+    return (end0, end1, "land_is_east") if end0.x >= end1.x else (end1, end0, "land_is_east")
+
+
+def _crossing_points(line, transect) -> List[Point]:
+    """Every point where ``line`` crosses ``transect`` (a rare overlap -> its rep. point)."""
+    if line is None:
+        return []
+    inter = line.intersection(transect)
+    if inter.is_empty:
+        return []
+    pts: List[Point] = []
+    for g in getattr(inter, "geoms", [inter]):
+        if g.geom_type == "Point":
+            pts.append(g)
+        else:  # collinear overlap (degenerate) -> representative point
+            pts.append(g.representative_point())
+    return pts
+
+
+def seaward_envelope(
+    merged_line,
+    transects: "gpd.GeoDataFrame",
+    watermask: Optional[Tuple[np.ndarray, Affine]] = None,
+    drop_loop_area_m2: float = config.MAX_INTERIOR_LOOP_AREA_M2,
+):
+    """Reduce a merged shoreline to the seaward-most land/water boundary (D1).
+
+    Channel mouths migrate year to year, so fixed closure geometry can't track
+    them. For each shore-normal transect, the crossing FARTHEST from that
+    transect's *landward* end is the open-coast shoreline; nearer crossings are
+    channel intrusions, lagoon shores, or behind-beach ponds and are discarded.
+    One seaward point per transect, ordered by ``transect_id`` alongshore, is
+    connected into the shoreline — which keeps the ocean side of a recurved spit
+    (Shah Porir Dwip) while flagging it. Small closed loops are dropped first as
+    belt-and-braces (``config.DROP_INTERIOR_LOOPS``).
+
+    Which transect end is landward is decided per transect by
+    :func:`_resolve_seaward` (water mask -> offshore reference -> ``LAND_IS_EAST``),
+    NOT by trusting the build-time orientation — so the reduction is robust where
+    the coast does not face west. The tally of methods used is returned for audit.
+
+    **Resolution tradeoff.** Each returned vertex is a sub-pixel *position* (the
+    marching-squares crossing, interpolated), but the connecting line is sampled at
+    the transect spacing (default 50 m), so the envelope is a 50-m-sampled polyline,
+    not the full-density sub-pixel curve. ``config.SHORELINE_MODE = "raw"`` keeps
+    the full-density sub-pixel line for cartography / the benchmark.
+
+    Args:
+        merged_line: The merged shoreline geometry (EPSG:32646).
+        transects: DSAS transects (EPSG:32646) with ``transect_id`` and a land->sea
+            geometry (vertex 0 on the baseline).
+        watermask: Optional ``(labels, transform)`` from :func:`classify_scene` —
+            the per-scene class raster and its affine — used as the primary
+            seaward-direction cue. When ``None`` the offshore reference is used.
+        drop_loop_area_m2: Small-loop area threshold for the belt-and-braces drop.
+
+    Returns:
+        ``(geometry, n_multi, methods)`` — a ``LineString``/``MultiLineString`` (or
+        ``None`` if fewer than two transects cross), the count of transects that
+        crossed more than once (recurved spits / complex mouths), and a
+        ``{"watermask": n1, "offshore_ref": n2, "land_is_east": n3}`` tally of how
+        each contributing transect's seaward end was resolved.
+    """
+    methods = {"watermask": 0, "offshore_ref": 0, "land_is_east": 0}
+    parts = _as_line_list(merged_line)
+    if config.DROP_INTERIOR_LOOPS:
+        parts = _drop_small_loops(parts, drop_loop_area_m2)
+    if not parts:
+        return None, 0, methods
+    work = unary_union(parts)
+
+    labels, transform = watermask if watermask is not None else (None, None)
+    ref = _seaward_reference_utm()
+
+    tdf = transects.sort_values("transect_id") \
+        if "transect_id" in transects.columns else transects
+    seaward_pts: List[Point] = []
+    n_multi = 0
+    for _, t in tdf.iterrows():
+        tr = t.geometry
+        if tr is None or tr.is_empty:
+            continue
+        pts = _crossing_points(work, tr)
+        if not pts:
+            continue
+        if len(pts) > 1:
+            n_multi += 1
+        _seaward_end, landward_end, method = _resolve_seaward(tr, labels, transform, ref)
+        # Most-seaward crossing = the one FARTHEST from the resolved landward end.
+        seaward_pts.append(max(pts, key=lambda p: p.distance(landward_end)))
+        methods[method] += 1
+
+    if len(seaward_pts) < 2:
+        return None, n_multi, methods
+    return LineString([(p.x, p.y) for p in seaward_pts]), n_multi, methods
 
 
 def _apply_channel_closures(
@@ -1479,13 +1719,42 @@ def _apply_channel_closures(
 # ===========================================================================
 # 2.6  Drivers
 # ===========================================================================
+def _load_or_build_transects() -> Optional["gpd.GeoDataFrame"]:
+    """Transects in EPSG:32646 for the seaward envelope, or ``None`` if unavailable.
+
+    Loads ``outputs/transects.geojson`` if present; else builds it from
+    ``data/baseline.geojson`` if that exists; else returns ``None`` (no baseline
+    digitised yet).
+    """
+    if os.path.exists(TRANSECTS_PATH):
+        return load_transects()
+    if os.path.exists(BASELINE_PATH):
+        build_transects()  # writes outputs/transects.geojson (EPSG:4326)
+        return load_transects()  # reprojected to EPSG:32646
+    return None
+
+
 def default_settings(
     water_index_name: str = config.WATER_INDEX_DEFAULT,
     threshold_method: str = config.THRESHOLD_METHOD_DEFAULT,
     classifier_version: str = DEFAULT_CLASSIFIER_VERSION,
     min_length_m: float = config.MIN_SHORELINE_LENGTH_M,
+    mode: Optional[str] = None,
 ) -> dict:
-    """Assemble an extraction ``settings`` dict (loads search zone + closures once)."""
+    """Assemble an extraction ``settings`` dict (loads search zone + closures +
+    transects once).
+
+    ``mode`` defaults to ``config.SHORELINE_MODE`` (pass ``"raw"``/``"envelope"``
+    to override — the one-liner for flipping the run). In ``"envelope"`` mode the
+    DSAS transects are loaded (built from ``data/baseline.geojson`` if needed); if
+    no baseline exists yet, ``transects`` is ``None``, a one-line note is printed,
+    and extraction falls back to raw.
+    """
+    mode = mode or config.SHORELINE_MODE
+    transects = _load_or_build_transects()
+    if mode == "envelope" and transects is None:
+        print("shoreline mode 'envelope' requested but no transects yet "
+              "(digitise data/baseline.geojson) -> falling back to 'raw'.")
     return {
         "water_index": water_index_name,
         "threshold_method": threshold_method,
@@ -1493,6 +1762,8 @@ def default_settings(
         "min_length_m": min_length_m,
         "search_zone": load_search_zone(),
         "channel_lines": load_channel_lines_utm(),
+        "mode": mode,
+        "transects": transects,
     }
 
 
@@ -1525,9 +1796,12 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
     index = water_index(scene, settings["water_index"])
     threshold = interface_threshold(index, labels, settings["threshold_method"])
     contours = extract_contour(index, threshold, scene.valid, scene.transform)
+    audit: Dict[str, object] = {}
     line_utm = filter_contours(
         contours, settings.get("search_zone"), settings.get("channel_lines", []),
         settings.get("min_length_m", config.MIN_SHORELINE_LENGTH_M),
+        mode=settings.get("mode"), transects=settings.get("transects"),
+        watermask=(labels, scene.transform), audit=audit,
     )
 
     length_m = float(line_utm.length) if line_utm is not None else 0.0
@@ -1570,6 +1844,8 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         "length_m": length_m,
         "n_vertices": n_vertices,
         "pct_aoi_alongshore_covered": min(100.0, 100.0 * length_m / AOI_ALONGSHORE_M),
+        "envelope_n_multi": int(audit.get("envelope_n_multi", 0)),
+        "seaward_methods": _fmt_methods(audit.get("seaward_methods")),
         "flags": ",".join(flags),
         "geometry": geom_wgs,
     }
@@ -1580,6 +1856,18 @@ def _count_vertices(geom) -> int:
     if geom is None:
         return 0
     return sum(len(ln.coords) for ln in _as_line_list(geom))
+
+
+def _fmt_methods(methods: Optional[dict]) -> str:
+    """Compact ``"watermask=..;offshore_ref=..;land_is_east=.."`` audit string.
+
+    Flattens the :func:`seaward_envelope` method tally to one string field so it
+    round-trips cleanly through GeoJSON/CSV. Empty when envelope mode did not run.
+    """
+    if not methods:
+        return ""
+    order = ["watermask", "offshore_ref", "land_is_east"]
+    return ";".join(f"{k}={int(methods.get(k, 0))}" for k in order)
 
 
 def extract_all(
@@ -1715,13 +2003,21 @@ def build_transects(
 ) -> "gpd.GeoDataFrame":
     """Cast shore-normal transects from a digitised baseline (DSAS/QSCAT).
 
-    Reads ``data/baseline.geojson`` — a single LineString digitised landward of
-    and roughly parallel to the coast — and casts transects every ``spacing_m``
-    along it, each ``length_m`` long and normal to the local baseline tangent,
-    pointing seaward (west, since ``LAND_IS_EAST``). Each transect is a
-    ``LineString`` ordered land->sea (vertex 0 on the baseline) with a stable
-    integer ``transect_id`` increasing alongshore — the convention
-    :func:`benchmark_extraction` and :func:`intersensor_bias` expect.
+    Reads ``data/baseline.geojson`` (landward of and roughly parallel to the
+    coast) and casts a transect every ``spacing_m``, each ``length_m`` long and
+    normal to the local baseline tangent, ordered land->sea (**vertex 0 = the
+    landward origin**) with a stable ``transect_id`` increasing alongshore.
+
+    * **Seaward orientation** is set by the offshore reference
+      (``config.SEAWARD_REFERENCE_LONLAT``): of the two normals, the one whose far
+      end is nearer that offshore point is seaward — robust where the coast does
+      not face west (Teknaf's hook, Shah Porir Dwip). ``LAND_IS_EAST`` is only a
+      last-resort default if no reference is configured. (The per-scene water mask
+      refines this further at extraction, in :func:`seaward_envelope`.)
+    * **Multi-part / gapped baseline**: a ``MultiLineString`` baseline is handled
+      by casting along each existing segment and NEVER across a gap — so breaking
+      the baseline at the Naf and Bakkhali estuary mouths excludes those reaches,
+      while ``transect_id`` stays continuous and ordered alongshore.
 
     Args:
         baseline_path: Path to the digitised baseline GeoJSON (EPSG:4326).
@@ -1733,10 +2029,13 @@ def build_transects(
         A ``GeoDataFrame`` of transects in EPSG:4326 with ``transect_id``.
     """
     gdf = gpd.read_file(baseline_path).to_crs(config.METRIC_CRS)
+    # linemerge only stitches segments that share endpoints, so deliberate gaps
+    # in a MultiLineString baseline survive as separate parts (no cross-gap cast).
     base = linemerge(unary_union(list(gdf.geometry)))
     baseline_parts = _as_line_list(base)
     if not baseline_parts:
         raise ValueError(f"{baseline_path} has no LineString baseline")
+    ref = _seaward_reference_utm()
 
     records: List[dict] = []
     tid = 0
@@ -1751,14 +2050,18 @@ def build_transects(
             tx, ty = (b.x - a.x), (b.y - a.y)
             norm = math.hypot(tx, ty) or 1.0
             tx, ty = tx / norm, ty / norm
-            nx, ny = -ty, tx  # left normal of the tangent
-            # Orient seaward: land is east, so seaward normals have nx < 0.
-            if (nx > 0) == LAND_IS_EAST:
+            nx, ny = -ty, tx  # a normal of the tangent
+            plus = Point(p.x + nx * length_m, p.y + ny * length_m)
+            if ref is not None:
+                minus = Point(p.x - nx * length_m, p.y - ny * length_m)
+                if ref.distance(minus) < ref.distance(plus):
+                    nx, ny = -nx, -ny  # -normal points more seaward
+            elif (nx > 0) == LAND_IS_EAST:  # last-resort default (land east -> sea west)
                 nx, ny = -nx, -ny
             end = (p.x + nx * length_m, p.y + ny * length_m)
             records.append({
                 "transect_id": tid,
-                "geometry": LineString([(p.x, p.y), end]),
+                "geometry": LineString([(p.x, p.y), end]),  # vertex 0 = landward origin
             })
             tid += 1
 
@@ -1906,7 +2209,11 @@ def benchmark_extraction(
                         thr = interface_threshold(index, labels, method)
                         contours = extract_contour(index, thr, scene.valid,
                                                    scene.transform)
-                        line = filter_contours(contours, search_zone, channel_lines)
+                        # Benchmark always measures RAW extraction (bit-for-bit),
+                        # independent of config.SHORELINE_MODE; mode is a config
+                        # axis the caller can add later.
+                        line = filter_contours(contours, search_zone, channel_lines,
+                                               mode="raw")
                         line_utm = _to_utm(line) if line is not None else None
                     except Exception:
                         continue

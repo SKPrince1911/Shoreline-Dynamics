@@ -266,6 +266,29 @@ MIN_SHORELINE_LENGTH_M: float = 300.0  # <-- TUNABLE
 # replaces CoastSat's scalar max_dist_ref). See PHASE2_SPEC.md §4.
 SEARCH_ZONE_PATH: str = "data/shoreline_search_zone.geojson"
 
+# Shoreline cleanup mode.
+#   "raw"      = contours -> clip to search zone -> channel closures -> merge ->
+#                min-length -> N->S sort. Kept bit-for-bit for benchmark comparison.
+#   "envelope" = additionally reduce to the SEAWARD-MOST land/water boundary at
+#                each alongshore transect. Channel mouths migrate year to year, so
+#                fixed closure geometry can't track them; the seaward envelope
+#                drops channel intrusions, lagoons, and behind-beach ponds
+#                automatically, wherever the mouth sits that year (year-agnostic).
+#                Needs transects (data/baseline.geojson); falls back to "raw" with
+#                a note if they are absent.  <-- TUNABLE
+SHORELINE_MODE: str = "envelope"   # <-- TUNABLE, "raw" | "envelope"
+# Belt-and-braces: drop small CLOSED contour loops (behind-beach ponds/lagoons)
+# whose enclosed area is below this; large loops (islands, big recurved spits)
+# are kept, open lines are never dropped.  <-- TUNABLE
+DROP_INTERIOR_LOOPS: bool = True
+MAX_INTERIOR_LOOP_AREA_M2: float = 50000.0  # <-- TUNABLE (5 ha)
+# A point WELL OFFSHORE in the Bay of Bengal. Used as the fallback seaward
+# reference when the water mask can't resolve a transect's seaward end (cloud/
+# no-data at both ends), and to orient transects at build time. Robust where the
+# coast does NOT face west (Teknaf's southern hook, Shah Porir Dwip), unlike a
+# fixed compass assumption.  <-- TUNABLE  (lon, lat)
+SEAWARD_REFERENCE_LONLAT: tuple = (91.7, 21.1)
+
 # A dry-season composite whose contributing acquisitions span more than this many
 # days mixes shoreline positions from different parts of the season (e.g. 1995 =
 # 1994-11-20 + 1995-03-19, 119 days apart). Per-scene extraction (D1) fixes the
