@@ -118,9 +118,59 @@ AOI_ALONGSHORE_M: float = 92000.0  # <-- TUNABLE
 LAND_IS_EAST: bool = True             # <-- TUNABLE
 CHANNEL_BUFFER_M: float = 250.0       # <-- TUNABLE (half-width searched around each closure line)
 
-# Classifier / model persistence.
+# Classifier / model persistence. Trained models are written to Google Drive when
+# it is mounted (so they SURVIVE a Colab runtime restart — the repo folder, and its
+# local ``models/``, is wiped on every restart), falling back to the local repo
+# ``models/`` only when Drive is absent. Loading and the "already trained?" check
+# look on Drive first, then local, so a model trained last session is reused, never
+# retrained.  <-- TUNABLE (paths)
 DEFAULT_CLASSIFIER_VERSION: str = "v1"
 MODELS_DIR: str = "models"
+DRIVE_MOUNT: str = "/content/drive/MyDrive"
+DRIVE_MODELS_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/models"
+
+
+def _drive_models_dir() -> Optional[str]:
+    """The Drive models dir if Drive is mounted, else ``None``."""
+    return DRIVE_MODELS_DIR if os.path.isdir(DRIVE_MOUNT) else None
+
+
+def _model_filename(sensor_group: str, version: str) -> str:
+    """Canonical model file name for a sensor group + version."""
+    return f"clf_{sensor_group}_{version}.joblib"
+
+
+def model_save_path(sensor_group: str, version: str = DEFAULT_CLASSIFIER_VERSION) -> str:
+    """Where a newly trained model is written: Drive if mounted, else local ``models/``."""
+    base = _drive_models_dir() or MODELS_DIR
+    return os.path.join(base, _model_filename(sensor_group, version))
+
+
+def find_model(
+    sensor_group: str, version: str = DEFAULT_CLASSIFIER_VERSION
+) -> Optional[str]:
+    """Path to an EXISTING model — Drive first, then local ``models/`` — or ``None``.
+
+    Use this for the 'already trained?' check so a model persisted to Drive last
+    session is detected and not retrained.
+    """
+    name = _model_filename(sensor_group, version)
+    candidates: List[str] = []
+    drive_dir = _drive_models_dir()
+    if drive_dir is not None:
+        candidates.append(os.path.join(drive_dir, name))
+    candidates.append(os.path.join(MODELS_DIR, name))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def model_exists(
+    sensor_group: str, version: str = DEFAULT_CLASSIFIER_VERSION
+) -> bool:
+    """Whether a trained model exists on Drive or locally (for skip-if-trained)."""
+    return find_model(sensor_group, version) is not None
 
 # Output locations (D-locked schema, PHASE2_SPEC.md §3).
 SHORELINE_DIR: str = os.path.join(config.OUTPUT_DIR, "shorelines")
@@ -1115,7 +1165,10 @@ def train_classifier(
 
     A ``StandardScaler`` + ``MLPClassifier(hidden=(100, 50), max_iter=500)``
     pipeline (fixed ``random_state`` for reproducibility) is fitted and dumped to
-    ``models/clf_{sensor_group}_{version}.joblib``.
+    :func:`model_save_path` — Google Drive
+    (``/content/drive/MyDrive/shoreline_dynamics/models/``) when mounted, else the
+    local repo ``models/``. The resolved path is printed so you can confirm it
+    landed on Drive (and will survive a runtime restart).
 
     Returns:
         The fitted scikit-learn pipeline.
@@ -1128,22 +1181,31 @@ def train_classifier(
         ]
     )
     clf.fit(X, y)
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    path = os.path.join(MODELS_DIR, f"clf_{sensor_group}_{version}.joblib")
+    path = model_save_path(sensor_group, version)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     joblib.dump(clf, path)
+    print(f"saved classifier -> {path}", flush=True)
     return clf
 
 
 def load_classifier(
     sensor_group: str, version: str = DEFAULT_CLASSIFIER_VERSION
 ) -> Pipeline:
-    """Load a persisted classifier for a sensor group."""
-    path = os.path.join(MODELS_DIR, f"clf_{sensor_group}_{version}.joblib")
-    if not os.path.exists(path):
+    """Load a persisted classifier — Drive first, then local ``models/``.
+
+    The resolved path is printed so you can confirm a model trained in a previous
+    session is being reused from Drive (not retrained).
+    """
+    path = find_model(sensor_group, version)
+    if path is None:
         raise FileNotFoundError(
-            f"classifier {path} not found — train it with train_classifier() first"
+            f"classifier {_model_filename(sensor_group, version)} not found on "
+            f"Drive ({DRIVE_MODELS_DIR}) or locally ({MODELS_DIR}) — train it with "
+            "train_classifier() first"
         )
-    return joblib.load(path)
+    clf = joblib.load(path)
+    print(f"loaded classifier <- {path}", flush=True)
+    return clf
 
 
 def evaluate_classifier(
@@ -1351,25 +1413,58 @@ def _weighted_peaks_threshold(values: np.ndarray) -> float:
     return float(centers[valley])
 
 
+# Interface mask: contours may only be traced where SAND meets WATER. Growing the
+# sand∪water∪whitewater region by a few pixels can give the contour room, but the
+# default is 0 (strict) — any >0 can admit a thin rim of 'other' (vegetation) at
+# the beach back-edge, exactly the boundary we are trying to exclude.  <-- TUNABLE
+INTERFACE_DILATE_PX: int = 0
+
+
+def interface_mask(labels: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """The sand↔water interface region — where a shoreline contour may be traced.
+
+    Includes only pixels classified SAND, WATER, or WHITEWATER (the beach/water
+    system) intersected with ``valid``, and EXCLUDES ``other`` (vegetation, road,
+    cliffs, buildings). Passing this to :func:`extract_contour` restricts
+    marching-squares to the sand↔water boundary: the true waterline (sand↔water) is
+    interior to the mask and traced in full, while the landward sand↔vegetation edge
+    sits at the mask boundary and produces no contour (its vertices are dropped as
+    they touch out-of-mask ``other`` pixels). Behind-beach ponds — water enclosed by
+    ``other`` — are likewise water↔other boundaries, excluded here (belt-and-braces:
+    the interior-loop drop also removes any that slip through).
+
+    ``INTERFACE_DILATE_PX`` (default 0 = strict) optionally grows the region so the
+    contour has room; keep it small, as any growth can readmit a thin ``other`` rim.
+    """
+    m = np.isin(
+        labels, (config.CLASS_SAND, config.CLASS_WATER, config.CLASS_WHITEWATER)
+    )
+    if INTERFACE_DILATE_PX > 0:
+        m = morphology.binary_dilation(m, morphology.disk(INTERFACE_DILATE_PX))
+    return m & valid.astype(bool)
+
+
 def extract_contour(
     index: np.ndarray,
     threshold: float,
-    valid: np.ndarray,
+    mask: np.ndarray,
     transform: Affine,
 ) -> List[LineString]:
     """Marching-squares sub-pixel contour of the index at ``threshold`` (D4).
 
     ``skimage.measure.find_contours`` returns vertices at sub-pixel (fractional
     row/col) precision; these are mapped to EPSG:32646 pixel *centres* via the
-    affine transform. Contours are broken (not bridged) across invalid/masked
-    pixels: any vertex whose 3x3 neighbourhood touches invalid data is dropped,
-    splitting the polyline there.
+    affine transform. ``mask`` is the region the contour may be traced in — pass
+    :func:`interface_mask` (sand∪water∪whitewater ∩ valid) so only the sand↔water
+    boundary is contoured, NOT the sand↔vegetation edge. Contours are broken (not
+    bridged) across out-of-mask pixels: any vertex whose 3x3 neighbourhood touches
+    a masked pixel is dropped, splitting the polyline there.
 
     Returns:
         A list of ``LineString`` geometries in EPSG:32646.
     """
     arr = index.astype(np.float64)
-    good = np.isfinite(arr) & valid.astype(bool)
+    good = np.isfinite(arr) & mask.astype(bool)
     if good.sum() < 2:
         return []
     fill = float(np.median(arr[good]))
@@ -2024,8 +2119,11 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
     labels = classify_scene(scene, clf)
     index = water_index(scene, settings["water_index"])
     threshold = interface_threshold(index, labels, settings["threshold_method"])
-    contours = extract_contour(index, threshold, scene.valid, scene.transform)
-    del index  # index is only needed through the contour step
+    # Trace the contour ONLY across the sand↔water interface (not the whole valid
+    # scene) so the landward sand↔vegetation edge cannot produce a shoreline.
+    iface = interface_mask(labels, scene.valid)
+    contours = extract_contour(index, threshold, iface, scene.transform)
+    del index, iface  # index/iface are only needed through the contour step
     audit: Dict[str, object] = {}
     line_utm = filter_contours(
         contours, settings.get("search_zone"), settings.get("channel_lines", []),
@@ -2544,8 +2642,13 @@ def benchmark_extraction(
                                   else _labels_all_interface(scene))
                         index = water_index(scene, name)
                         thr = interface_threshold(index, labels, method)
-                        contours = extract_contour(index, thr, scene.valid,
-                                                   scene.transform)
+                        # Contour the sand↔water interface only (matches the
+                        # operational extract_shoreline). For the 'none' arm every
+                        # valid pixel is SAND, so the mask reduces to scene.valid.
+                        contours = extract_contour(
+                            index, thr, interface_mask(labels, scene.valid),
+                            scene.transform,
+                        )
                         # Benchmark always measures RAW extraction (bit-for-bit),
                         # independent of config.SHORELINE_MODE; mode is a config
                         # axis the caller can add later.
