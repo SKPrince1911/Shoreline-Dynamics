@@ -32,6 +32,7 @@ pixel-aligned — required for the inter-sensor bias test and the benchmark).
 from __future__ import annotations
 
 import csv
+import gc
 import logging
 import math
 import os
@@ -99,6 +100,13 @@ _LANDSAT_COLLECTIONS: Dict[str, str] = data._LANDSAT_COLLECTIONS
 # GEE's payload limit. Each tile is fetched separately and mosaicked client-side.
 DEFAULT_TILE_PX: int = 768  # <-- TUNABLE (px per fetch tile; keep tile*tile*nbands*4 < ~32 MB)
 DOWNLOAD_RETRIES: int = 4   # <-- TUNABLE
+
+# Classifier feature/predict blocking: the full-coast search-zone bbox is tens of
+# millions of 10 m pixels, so building the 20-layer feature stack over the whole
+# grid at once OOMs Colab. classify_scene instead processes ``CLASSIFY_BLOCK_ROWS``
+# rows at a time (features -> predict -> write labels -> free), bounding peak RAM to
+# one block regardless of scene size.  <-- TUNABLE
+CLASSIFY_BLOCK_ROWS: int = 512
 
 # Approximate open-coast alongshore length (m), used to report the fraction of
 # the coast a scene's shoreline spans. ~92 km Cox's Bazar–Teknaf coast.
@@ -944,7 +952,12 @@ def _local_std(a: np.ndarray, size: int = 3) -> np.ndarray:
     """3x3 local standard deviation (texture) via uniform filters.
 
     ``std = sqrt(E[x^2] - E[x]^2)``; NaNs are treated as 0 so the filter does not
-    propagate them (the caller masks invalid pixels separately).
+    propagate them (the caller masks invalid pixels separately). The variance is
+    accumulated in float64 (``E[x^2] - E[x]^2`` cancels badly in float32 for the
+    near-constant windows that are common on calm water/dry sand), then the result
+    is returned as float32. This is a per-BLOCK computation (row-blocked caller),
+    so the float64 temporaries are block-sized, not whole-grid — bit-identical to
+    the previous whole-grid result while keeping peak RAM low.
     """
     a = np.nan_to_num(a.astype(np.float64), nan=0.0)
     mean = ndimage.uniform_filter(a, size=size, mode="reflect")
@@ -954,51 +967,71 @@ def _local_std(a: np.ndarray, size: int = 3) -> np.ndarray:
 
 
 def _norm_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Normalised difference ``(a - b) / (a + b)`` with 0/0 -> NaN."""
-    num = a - b
+    """Normalised difference ``(a - b) / (a + b)`` with 0/0 -> NaN, kept float32."""
+    a = a.astype(np.float32, copy=False)
+    b = b.astype(np.float32, copy=False)
     den = a + b
     with np.errstate(divide="ignore", invalid="ignore"):
-        out = np.where(den == 0, np.nan, num / den)
-    return out.astype(np.float32)
+        out = (a - b) / den  # float32 / float32 -> float32 (no float64 upcast)
+    out[den == 0] = np.float32("nan")
+    return out
 
 
-def _base_layers(scene: Scene) -> Dict[str, np.ndarray]:
-    """Reflectances + water/veg indices used as classifier feature bases."""
-    b = scene.bands
-    layers = {name: b[name] for name in CANONICAL_BANDS}
-    layers["mndwi"] = _norm_diff(b["green"], b["swir1"])
-    layers["ndwi"] = _norm_diff(b["green"], b["nir"])
-    layers["ndvi"] = _norm_diff(b["nir"], b["red"])
-    layers["mndwi2"] = _norm_diff(b["green"], b["swir2"])
-    return layers
+def _block_feature_matrix(
+    scene: Scene, mask: np.ndarray, r0: int, r1: int, halo: int = 1
+) -> np.ndarray:
+    """``(n, 20)`` float32 features for the in-mask pixels of core rows ``[r0:r1]``.
 
-
-def _iter_feature_layers(scene: Scene):
-    """Yield the 20 feature layers one at a time (order = ``FEATURE_NAMES``).
-
-    Ten base layers (6 reflectances + MNDWI/NDWI/NDVI/MNDWI2), then their 3x3
-    local std (texture separates bright whitewater from dry sand). Yielding one
-    (H, W) layer at a time — rather than stacking all 20 — keeps peak memory to a
-    couple of full arrays instead of ~20x the grid (a 10 m search-zone bbox is
-    tens of millions of pixels; a 20-deep float32 stack would be gigabytes).
+    Base reflectances + 4 indices + their 3x3 texture are computed on a
+    halo-expanded row block (``[r0-halo : r1+halo]``) so the texture at the block's
+    interior rows uses the real neighbouring rows — identical to the whole-grid
+    result; only the true grid top/bottom edges fall back to ``reflect`` (as before).
+    Feature order matches ``FEATURE_NAMES`` (10 base values, then 10 ``*_std3``).
+    Everything is float32; only :func:`_local_std`'s block-sized variance is float64.
     """
-    layers = _base_layers(scene)
-    for name in _FEATURE_BASE:
-        yield layers[name]
-    for name in _FEATURE_BASE:
-        yield _local_std(layers[name])
+    height = scene.valid.shape[0]
+    hr0 = max(0, r0 - halo)
+    hr1 = min(height, r1 + halo)
+    clo = r0 - hr0                 # core-row offset within the halo block
+    chi = clo + (r1 - r0)
+    b = {name: scene.bands[name][hr0:hr1] for name in CANONICAL_BANDS}  # views, no copy
+    base = [b[name] for name in CANONICAL_BANDS]        # 6 reflectances (blue..swir2)
+    base.append(_norm_diff(b["green"], b["swir1"]))     # mndwi
+    base.append(_norm_diff(b["green"], b["nir"]))       # ndwi
+    base.append(_norm_diff(b["nir"], b["red"]))         # ndvi
+    base.append(_norm_diff(b["green"], b["swir2"]))     # mndwi2
+    core_flat = mask[r0:r1].reshape(-1)
+    cols: List[np.ndarray] = []
+    for layer in base:                                  # 10 value features
+        cols.append(layer[clo:chi].reshape(-1)[core_flat])
+    for layer in base:                                  # 10 texture features
+        cols.append(_local_std(layer)[clo:chi].reshape(-1)[core_flat])
+    del base, b
+    if not cols:
+        return np.empty((0, feats_dim()), dtype=np.float32)
+    return np.column_stack(cols).astype(np.float32, copy=False)
 
 
-def _feature_matrix(scene: Scene, mask: np.ndarray) -> np.ndarray:
-    """Build the ``(N, 20)`` feature matrix for the ``mask`` pixels only.
+def _feature_matrix(
+    scene: Scene, mask: np.ndarray, block_rows: int = CLASSIFY_BLOCK_ROWS
+) -> np.ndarray:
+    """Build the ``(N, 20)`` float32 feature matrix for the ``mask`` pixels only.
 
-    Extracts each feature layer's values at the ``N = mask.sum()`` selected
-    pixels without ever materialising the full ``(H, W, 20)`` cube — the layer is
-    freed before the next is built.
+    Row-blocked: features for the whole scene are never materialised at once — each
+    row block is built, its in-mask rows kept, and the block freed. Row-major order
+    is preserved (blocks top-to-bottom, C-order within each), so the returned rows
+    align with ``mask.reshape(-1)[mask.reshape(-1)]`` exactly as before.
     """
-    flat = mask.reshape(-1)
-    cols = [layer.reshape(-1)[flat] for layer in _iter_feature_layers(scene)]
-    return np.column_stack(cols).astype(np.float32) if cols else np.empty((0, feats_dim()))
+    height = scene.valid.shape[0]
+    blocks: List[np.ndarray] = []
+    for r0 in range(0, height, block_rows):
+        r1 = min(r0 + block_rows, height)
+        if not mask[r0:r1].any():
+            continue
+        blocks.append(_block_feature_matrix(scene, mask, r0, r1))
+    if not blocks:
+        return np.empty((0, feats_dim()), dtype=np.float32)
+    return np.vstack(blocks).astype(np.float32, copy=False)
 
 
 def _search_zone_mask(scene: Scene) -> np.ndarray:
@@ -1178,23 +1211,37 @@ def classify_scene(
         zone_mask: Optional precomputed search-zone boolean mask (same shape as
             ``scene.valid``); computed from the digitised zone when omitted.
 
+    Memory: features are built and predicted ONE ROW BLOCK
+    (``CLASSIFY_BLOCK_ROWS``) at a time and the block freed, so peak RAM is one
+    block's feature matrix rather than the whole-grid 20-layer stack (which OOMs
+    Colab on the full-coast bbox). Labels are ``int16`` (class codes 0-3).
+
     Returns:
-        An ``(H, W)`` int array in {0, 1, 2, 3}.
+        An ``(H, W)`` int16 array in {0, 1, 2, 3}.
     """
     height, width = scene.valid.shape
     if zone_mask is None:
         zone_mask = _search_zone_mask(scene)
     mask = scene.valid & zone_mask
-    labels = np.full(height * width, config.CLASS_OTHER, dtype=int)
-    flat = mask.reshape(-1)
-    if flat.any():
-        X = np.nan_to_num(_feature_matrix(scene, mask), nan=0.0, posinf=0.0, neginf=0.0)
-        labels[flat] = clf.predict(X)
-    labels = labels.reshape(height, width)
-    if config.LABEL_MAJORITY_FILTER and flat.any():
+    labels = np.full((height, width), config.CLASS_OTHER, dtype=np.int16)
+    any_masked = bool(mask.any())
+    if any_masked:
+        for r0 in range(0, height, CLASSIFY_BLOCK_ROWS):
+            r1 = min(r0 + CLASSIFY_BLOCK_ROWS, height)
+            core = mask[r0:r1]
+            if not core.any():
+                continue
+            X = _block_feature_matrix(scene, mask, r0, r1)
+            np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            pred = clf.predict(X).astype(np.int16)
+            labels[r0:r1][core] = pred  # writes through the row-slice view
+            del X, pred
+        gc.collect()
+    if config.LABEL_MAJORITY_FILTER and any_masked:
         # Filter the label raster, then re-force out-of-zone pixels back to OTHER
         # so the filter cannot leak classes past the search-zone boundary.
-        labels = np.where(mask, _majority_filter_labels(labels), config.CLASS_OTHER)
+        labels = np.where(mask, _majority_filter_labels(labels),
+                          config.CLASS_OTHER).astype(np.int16)
     return labels
 
 
@@ -1224,8 +1271,13 @@ def water_index(scene: Scene, name: str = config.WATER_INDEX_DEFAULT) -> np.ndar
     if name == "ndwi":
         return _norm_diff(b["green"], b["nir"])
     if name == "aweinsh":
-        return (4.0 * (b["green"] - b["swir1"])
-                - (0.25 * b["nir"] + 2.75 * b["swir2"])).astype(np.float32)
+        g = b["green"].astype(np.float32, copy=False)
+        s1 = b["swir1"].astype(np.float32, copy=False)
+        nir = b["nir"].astype(np.float32, copy=False)
+        s2 = b["swir2"].astype(np.float32, copy=False)
+        # np.float32 constants keep the whole expression in float32 (no upcast).
+        return (np.float32(4.0) * (g - s1)
+                - (np.float32(0.25) * nir + np.float32(2.75) * s2))
     if name == "scowi":
         if not SCOWI_VERIFIED:
             raise NotImplementedError(
@@ -1973,6 +2025,7 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
     index = water_index(scene, settings["water_index"])
     threshold = interface_threshold(index, labels, settings["threshold_method"])
     contours = extract_contour(index, threshold, scene.valid, scene.transform)
+    del index  # index is only needed through the contour step
     audit: Dict[str, object] = {}
     line_utm = filter_contours(
         contours, settings.get("search_zone"), settings.get("channel_lines", []),
@@ -1980,6 +2033,10 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         mode=settings.get("mode"), transects=settings.get("transects"),
         watermask=(labels, scene.transform), audit=audit,
     )
+    # labels (int16 whole-grid) and contours are no longer needed once the line
+    # is built; free them so only scalars + geometry survive to the record.
+    del labels, contours
+    gc.collect()
 
     length_m = float(line_utm.length) if line_utm is not None else 0.0
     n_vertices = _count_vertices(line_utm)
@@ -2051,6 +2108,31 @@ def _fmt_methods(methods: Optional[dict]) -> str:
     return ";".join(f"{k}={int(methods.get(k, 0))}" for k in order)
 
 
+def _mem_mb() -> Tuple[float, float]:
+    """``(current_rss_mb, peak_rss_mb)`` for this process (best-effort).
+
+    Uses ``psutil`` for the live RSS when available (so a flat trace across scenes
+    proves there is no leak), and ``resource.getrusage`` for the process high-water
+    mark. Either may be ``nan`` if the platform doesn't provide it.
+    """
+    cur = float("nan")
+    try:
+        import psutil  # optional
+        cur = psutil.Process().memory_info().rss / 1e6
+    except Exception:
+        pass
+    peak = float("nan")
+    try:
+        import resource
+        # ru_maxrss is KiB on Linux (Colab); convert to MB.
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except Exception:
+        pass
+    if cur != cur and peak == peak:  # cur unavailable, peak known -> report peak
+        cur = peak
+    return cur, peak
+
+
 def extract_all(
     scene_list: pd.DataFrame,
     settings: dict,
@@ -2059,6 +2141,7 @@ def extract_all(
     log_path: str = EXTRACTION_LOG_PATH,
     resume: bool = True,
     tile_px: int = DEFAULT_TILE_PX,
+    verbose: bool = True,
 ) -> "gpd.GeoDataFrame":
     """Extract every scene in a list, checkpointing after each one (D1/§3).
 
@@ -2095,11 +2178,13 @@ def extract_all(
             done.add(rec.get("image_id"))
 
     clf_cache: Dict[str, Pipeline] = dict(classifiers or {})
-    for _, row in scene_list.iterrows():
+    n_total = len(scene_list)
+    for i, (_, row) in enumerate(scene_list.iterrows(), start=1):
         image_id = str(row["image_id"])
         if image_id in done:
             continue
         group = sensor_group(str(row["sensor"]))
+        scene = None
         try:
             if group not in clf_cache:
                 clf_cache[group] = load_classifier(group, version)
@@ -2108,10 +2193,27 @@ def extract_all(
             record = extract_shoreline(scene, clf_cache[group], settings)
             records.append(record)
             _write_checkpoint(records, checkpoint_path)
+            # Drop the scene's pixel arrays before the next fetch so RAM doesn't
+            # accumulate across the ~829 dense scenes. The record holds only scalars
+            # + a shapely geometry (no arrays), so nothing pins the grid.
+            del scene
+            scene = None
+            gc.collect()
+            cur_mb, peak_mb = _mem_mb()
             _append_log(log_path, image_id, "ok",
-                        f"length_m={record['length_m']:.1f}")
+                        f"length_m={record['length_m']:.1f} rss_mb={cur_mb:.0f} "
+                        f"peak_mb={peak_mb:.0f}")
+            if verbose:
+                print(f"[{i}/{n_total}] {image_id[:32]}: length_m="
+                      f"{record['length_m']:.0f} | rss={cur_mb:.0f} MB "
+                      f"(peak {peak_mb:.0f} MB)", flush=True)
         except Exception as exc:  # keep going; a bad scene must not abort the run
             _append_log(log_path, image_id, "error", f"{type(exc).__name__}: {exc}")
+        finally:
+            # Ensure the scene is released even on failure (no cross-iteration leak).
+            if scene is not None:
+                del scene
+            gc.collect()
     return _records_to_gdf(records)
 
 
@@ -2387,7 +2489,7 @@ def _labels_all_interface(scene: Scene) -> np.ndarray:
     Used by the benchmark's ``classifier='none'`` arm so the threshold is taken
     on the full valid-scene index (the old-pipeline behaviour) for comparison.
     """
-    labels = np.full(scene.valid.shape, config.CLASS_OTHER, dtype=int)
+    labels = np.full(scene.valid.shape, config.CLASS_OTHER, dtype=np.int16)
     labels[scene.valid] = config.CLASS_SAND  # sand∪water == all valid
     return labels
 
