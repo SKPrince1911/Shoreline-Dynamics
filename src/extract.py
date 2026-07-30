@@ -1597,67 +1597,110 @@ def _label_at(pt: Point, transform: Affine, labels: np.ndarray) -> Optional[int]
     return None
 
 
-def _inset_point(end: Point, other: Point, inset_m: float) -> Point:
-    """A point ``inset_m`` in from ``end`` toward ``other`` (i.e. just inside).
+def _seaward_by_water(
+    tr: LineString,
+    end0: Point,
+    end1: Point,
+    labels: np.ndarray,
+    transform: Affine,
+    sample_step_m: Optional[float] = None,
+) -> Tuple[Optional[Point], Optional[Point], str]:
+    """Seaward end from where WATER sits relative to SAND ALONG the transect.
 
-    Sampling the label a short distance in from a transect endpoint (rather than
-    exactly at it) avoids the sub-pixel edge and any no-data ring at the very tip.
+    Sampling only NEAR the two endpoints fails on this coast: a 1500 m transect
+    cast from a baseline set ~200-500 m inland overshoots the search zone at BOTH
+    ends (its landward tip is behind the beach, its seaward tip is past the zone's
+    seaward edge), so both endpoints read out-of-zone ``OTHER`` and the water band
+    — a strip near the shoreline in the middle of the transect — is never sampled.
+    Instead the whole transect is walked at ~pixel spacing and the mean along-track
+    distances of the WATER and SAND samples are compared: water lies seaward of
+    sand, so the end that water is biased toward is seaward. This is orientation-
+    free and adapts to any local coastline heading (Teknaf's hook included).
+
+    Returns:
+        ``(seaward, landward, "")`` on success, else ``(None, None, reason)`` with
+        ``reason`` in ``{"no_water", "no_sand", "tie"}`` when the ordering is
+        indeterminate (the caller then uses the local-normal fallback).
     """
-    dx, dy = (other.x - end.x), (other.y - end.y)
-    d = math.hypot(dx, dy) or 1.0
-    f = min(inset_m, d) / d
-    return Point(end.x + dx * f, end.y + dy * f)
+    length = tr.length
+    if length <= 0:
+        return None, None, "no_water"
+    step = sample_step_m if (sample_step_m and sample_step_m > 0) else (abs(transform.a) or 10.0)
+    n = max(2, int(math.ceil(length / step)))
+    water: List[float] = []
+    sand: List[float] = []
+    for i in range(n + 1):
+        d = length * i / n
+        lab = _label_at(tr.interpolate(d), transform, labels)
+        if lab == config.CLASS_WATER:
+            water.append(d)
+        elif lab == config.CLASS_SAND:
+            sand.append(d)
+    if not water:
+        return None, None, "no_water"
+    if not sand:
+        return None, None, "no_sand"
+    dw = sum(water) / len(water)
+    ds = sum(sand) / len(sand)
+    if dw == ds:
+        return None, None, "tie"
+    # water farther from end0 than sand -> end1 is seaward; else end0.
+    return (end1, end0, "") if dw > ds else (end0, end1, "")
 
 
 def _resolve_seaward(
     tr: LineString,
     labels: Optional[np.ndarray],
     transform: Optional[Affine],
-    ref_utm: Optional[Point],
-    inset_m: float = 30.0,
-) -> Tuple[Point, Point, str]:
+    sample_step_m: Optional[float] = None,
+) -> Tuple[Point, Point, str, str]:
     """Decide which end of a transect is seaward (robust off the west-facing coast).
 
-    Priority (each transect is resolved by exactly one, and the method is reported
-    so robustness at the southern hook — Teknaf, Shah Porir Dwip, where the coast
-    does NOT face west — is auditable):
+    Priority (each transect is resolved by exactly one; the method — and, on
+    fall-through, WHY the water mask could not resolve it — is reported so
+    robustness at the southern hook is auditable):
 
-    1. ``"watermask"`` (primary) — sample the per-scene classifier label a short
-       distance in from each end; the end sitting on WATER (and only that end) is
-       seaward. Ambiguous when both or neither end reads water (channel mouths,
-       lagoons behind a spit) -> fall through.
-    2. ``"offshore_ref"`` (fallback) — the endpoint nearer
-       ``config.SEAWARD_REFERENCE_LONLAT`` (a point well offshore in the Bay) is
-       seaward. Used when the water mask is ambiguous or unavailable.
-    3. ``"land_is_east"`` (last resort) — with no reference configured, the coast's
-       land-east / sea-west default picks the smaller-easting endpoint as seaward.
+    1. ``"watermask"`` (primary) — :func:`_seaward_by_water` walks the whole
+       transect and orders WATER vs SAND. Should resolve the vast majority of
+       transects on a clear scene.
+    2. ``"baseline_normal"`` (fallback) — the local outward normal: :func:`build_transects`
+       cast ``coords[-1]`` on the seaward side using a per-part-consistent normal
+       sign, so the far end from the baseline origin is trusted as seaward. This
+       replaces the old single-offshore-point test, which mis-orients a long
+       curving coast.
+    3. ``"land_is_east"`` (last resort) — degenerate transect only: land-east /
+       sea-west picks the smaller-easting end.
 
     Returns:
-        ``(seaward_end, landward_end, method)`` — the two endpoints of ``tr`` in the
-        resolved land->sea order, plus the method label.
+        ``(seaward_end, landward_end, method, fallback_reason)`` — the endpoints in
+        resolved land->sea order, the method, and (when the water mask fell through)
+        the reason in ``{"no_water", "no_sand", "tie", "no_labels"}`` (``""`` when
+        the water mask succeeded).
     """
     end0 = Point(tr.coords[0])
     end1 = Point(tr.coords[-1])
 
-    # 1. Water mask — sample a short distance in from each end.
+    # 1. Water mask — order WATER vs SAND sampled along the whole transect.
     if labels is not None and transform is not None:
-        l0 = _label_at(_inset_point(end0, end1, inset_m), transform, labels)
-        l1 = _label_at(_inset_point(end1, end0, inset_m), transform, labels)
-        w0 = l0 == config.CLASS_WATER
-        w1 = l1 == config.CLASS_WATER
-        if w0 != w1:  # exactly one end is water -> unambiguous
-            return (end0, end1, "watermask") if w0 else (end1, end0, "watermask")
+        seaward, landward, reason = _seaward_by_water(tr, end0, end1, labels, transform,
+                                                      sample_step_m)
+        if seaward is not None:
+            return seaward, landward, "watermask", ""
+        fb_reason = reason
+    else:
+        fb_reason = "no_labels"
 
-    # 2. Offshore reference — the end nearer the Bay-of-Bengal point is seaward.
-    if ref_utm is not None:
-        if ref_utm.distance(end0) <= ref_utm.distance(end1):
-            return end0, end1, "offshore_ref"
-        return end1, end0, "offshore_ref"
+    # 2. Local outward normal — trust build_transects' per-part-consistent seaward
+    #    orientation (coords[-1] is the far, seaward end from the baseline origin).
+    if not end0.equals(end1):
+        return end1, end0, "baseline_normal", fb_reason
 
-    # 3. Last resort — land east, sea west: the smaller-easting end is seaward.
+    # 3. Last resort (degenerate transect) — land east, sea west.
     if LAND_IS_EAST:
-        return (end0, end1, "land_is_east") if end0.x <= end1.x else (end1, end0, "land_is_east")
-    return (end0, end1, "land_is_east") if end0.x >= end1.x else (end1, end0, "land_is_east")
+        return (end0, end1, "land_is_east", fb_reason) if end0.x <= end1.x \
+            else (end1, end0, "land_is_east", fb_reason)
+    return (end0, end1, "land_is_east", fb_reason) if end0.x >= end1.x \
+        else (end1, end0, "land_is_east", fb_reason)
 
 
 def _crossing_points(line, transect) -> List[Point]:
@@ -1694,9 +1737,10 @@ def seaward_envelope(
     belt-and-braces (``config.DROP_INTERIOR_LOOPS``).
 
     Which transect end is landward is decided per transect by
-    :func:`_resolve_seaward` (water mask -> offshore reference -> ``LAND_IS_EAST``),
-    NOT by trusting the build-time orientation — so the reduction is robust where
-    the coast does not face west. The tally of methods used is returned for audit.
+    :func:`_resolve_seaward` (water mask -> local baseline normal -> ``LAND_IS_EAST``).
+    The water mask is primary and orientation-free, so the reduction is robust where
+    the coast does not face west. The tally of methods used — and, on fall-through,
+    why the water mask could not resolve a transect — is returned for audit.
 
     **Resolution tradeoff.** Each returned vertex is a sub-pixel *position* (the
     marching-squares crossing, interpolated), but the connecting line is sampled at
@@ -1709,18 +1753,23 @@ def seaward_envelope(
         transects: DSAS transects (EPSG:32646) with ``transect_id`` and a land->sea
             geometry (vertex 0 on the baseline).
         watermask: Optional ``(labels, transform)`` from :func:`classify_scene` —
-            the per-scene class raster and its affine — used as the primary
-            seaward-direction cue. When ``None`` the offshore reference is used.
+            the per-scene class raster and its affine — the PRIMARY seaward cue.
+            When ``None`` the local baseline normal is used.
         drop_loop_area_m2: Small-loop area threshold for the belt-and-braces drop.
 
     Returns:
         ``(geometry, n_multi, methods)`` — a ``LineString``/``MultiLineString`` (or
         ``None`` if fewer than two transects cross), the count of transects that
-        crossed more than once (recurved spits / complex mouths), and a
-        ``{"watermask": n1, "offshore_ref": n2, "land_is_east": n3}`` tally of how
-        each contributing transect's seaward end was resolved.
+        crossed more than once (recurved spits / complex mouths), and a ``methods``
+        tally: the resolution method per contributing transect
+        (``watermask``/``baseline_normal``/``land_is_east``) plus the fall-through
+        reason breakdown (``fb_no_water``/``fb_no_sand``/``fb_tie``/``fb_no_labels``)
+        for the transects the water mask could not resolve.
     """
-    methods = {"watermask": 0, "offshore_ref": 0, "land_is_east": 0}
+    methods = {
+        "watermask": 0, "baseline_normal": 0, "land_is_east": 0,
+        "fb_no_water": 0, "fb_no_sand": 0, "fb_tie": 0, "fb_no_labels": 0,
+    }
     parts = _as_line_list(merged_line)
     if config.DROP_INTERIOR_LOOPS:
         parts = _drop_small_loops(parts, drop_loop_area_m2)
@@ -1729,7 +1778,6 @@ def seaward_envelope(
     work = unary_union(parts)
 
     labels, transform = watermask if watermask is not None else (None, None)
-    ref = _seaward_reference_utm()
 
     tdf = transects.sort_values("transect_id") \
         if "transect_id" in transects.columns else transects
@@ -1744,14 +1792,58 @@ def seaward_envelope(
             continue
         if len(pts) > 1:
             n_multi += 1
-        _seaward_end, landward_end, method = _resolve_seaward(tr, labels, transform, ref)
+        _seaward_end, landward_end, method, reason = _resolve_seaward(tr, labels, transform)
         # Most-seaward crossing = the one FARTHEST from the resolved landward end.
         seaward_pts.append(max(pts, key=lambda p: p.distance(landward_end)))
         methods[method] += 1
+        if reason:  # water mask fell through -> record why
+            methods[f"fb_{reason}"] = methods.get(f"fb_{reason}", 0) + 1
 
     if len(seaward_pts) < 2:
         return None, n_multi, methods
     return LineString([(p.x, p.y) for p in seaward_pts]), n_multi, methods
+
+
+def seaward_debug(
+    transects: "gpd.GeoDataFrame",
+    labels: np.ndarray,
+    transform: Affine,
+    sample_ids: Optional[Sequence[int]] = None,
+    n: int = 6,
+) -> None:
+    """Print the seaward-resolution trace for a handful of transects (diagnostic).
+
+    For each sampled transect, shows both endpoints' UTM coords, the computed
+    ``(row, col)`` pixel and whether it is in-bounds, the label there, and the
+    resolved seaward end + method (+ fall-through reason). Use it in the notebook to
+    verify the UTM->pixel->label lookup and see why any transect falls back — e.g.
+    ``extract.seaward_debug(settings['transects'], labels, sc.transform)``.
+    """
+    tdf = transects.sort_values("transect_id") \
+        if "transect_id" in transects.columns else transects
+    rows = list(tdf.iterrows())
+    if sample_ids is not None:
+        want = {int(i) for i in sample_ids}
+        picks = [r for r in rows if int(r[1].get("transect_id", -1)) in want]
+    else:
+        step = max(1, len(rows) // max(1, n))
+        picks = rows[::step][:n]
+    h, w = labels.shape
+    for _, t in picks:
+        tr = t.geometry
+        tid = int(t.get("transect_id", -1))
+        e0, e1 = Point(tr.coords[0]), Point(tr.coords[-1])
+        for tag, e in (("origin", e0), ("far", e1)):
+            col, row = (~transform) * (e.x, e.y)
+            r, c = int(round(row)), int(round(col))
+            inb = 0 <= r < h and 0 <= c < w
+            lab = int(labels[r, c]) if inb else None
+            print(f"  t{tid:<5d} {tag:6s} UTM=({e.x:.0f},{e.y:.0f}) "
+                  f"-> (row={r},col={c}) inbounds={inb} label={lab}")
+        seaward, _landward, method, reason = _resolve_seaward(tr, labels, transform)
+        which = "far" if seaward.equals(e1) else "origin"
+        tail = f" reason={reason}" if reason else ""
+        print(f"  t{tid:<5d} -> seaward={which} method={method}{tail}")
 
 
 def _apply_channel_closures(
@@ -1944,14 +2036,18 @@ def _count_vertices(geom) -> int:
 
 
 def _fmt_methods(methods: Optional[dict]) -> str:
-    """Compact ``"watermask=..;offshore_ref=..;land_is_east=.."`` audit string.
+    """Compact ``"watermask=..;baseline_normal=..;..."`` seaward-audit string.
 
-    Flattens the :func:`seaward_envelope` method tally to one string field so it
+    Flattens the :func:`seaward_envelope` method tally — the three resolution
+    methods plus the water-mask fall-through reasons — to one string field so it
     round-trips cleanly through GeoJSON/CSV. Empty when envelope mode did not run.
     """
     if not methods:
         return ""
-    order = ["watermask", "offshore_ref", "land_is_east"]
+    order = [
+        "watermask", "baseline_normal", "land_is_east",
+        "fb_no_water", "fb_no_sand", "fb_tie", "fb_no_labels",
+    ]
     return ";".join(f"{k}={int(methods.get(k, 0))}" for k in order)
 
 
@@ -2080,6 +2176,32 @@ def merge_annual(gdf: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame":
 # ===========================================================================
 # 6.  Benchmark + validation (Phase 2 deliverables)
 # ===========================================================================
+def _seaward_sign(
+    samples: List[Tuple[Point, float, float]], ref: Optional[Point]
+) -> float:
+    """The single normal sign (+1/-1) that points seaward for a baseline part.
+
+    Voting ONCE per part — rather than choosing the sign per vertex by distance to
+    one offshore point — keeps the outward normal consistent as the baseline
+    curves. With a reference, the sign is whichever makes the summed dot product of
+    ``(ref - p)`` with the normal positive (the reference lies on the seaward side
+    of the part overall). Without one, it falls back to the land-east / sea-west
+    default (seaward normal has negative easting). ``samples`` is a list of
+    ``(point, normal_x, normal_y)``.
+    """
+    if not samples:
+        return 1.0
+    if ref is not None:
+        vote = sum((ref.x - p.x) * nx + (ref.y - p.y) * ny for (p, nx, ny) in samples)
+        if vote != 0.0:
+            return 1.0 if vote > 0 else -1.0
+    # No reference (or a dead-even vote): land east -> seaward normal points west.
+    mean_nx = sum(nx for (_p, nx, _ny) in samples) / len(samples)
+    if LAND_IS_EAST:
+        return -1.0 if mean_nx > 0 else 1.0
+    return 1.0 if mean_nx > 0 else -1.0
+
+
 def build_transects(
     baseline_path: str = BASELINE_PATH,
     spacing_m: float = TRANSECT_SPACING_M,
@@ -2093,12 +2215,14 @@ def build_transects(
     normal to the local baseline tangent, ordered land->sea (**vertex 0 = the
     landward origin**) with a stable ``transect_id`` increasing alongshore.
 
-    * **Seaward orientation** is set by the offshore reference
-      (``config.SEAWARD_REFERENCE_LONLAT``): of the two normals, the one whose far
-      end is nearer that offshore point is seaward — robust where the coast does
-      not face west (Teknaf's hook, Shah Porir Dwip). ``LAND_IS_EAST`` is only a
-      last-resort default if no reference is configured. (The per-scene water mask
-      refines this further at extraction, in :func:`seaward_envelope`.)
+    * **Seaward orientation** is set once PER PART (:func:`_seaward_sign`) from the
+      offshore reference (``config.SEAWARD_REFERENCE_LONLAT``): the single normal
+      sign whose sum points toward the Bay across the whole part is used for every
+      transect on it, so the outward normal stays consistent as the baseline curves
+      (a per-vertex distance-to-point test flips erratically around Teknaf's hook).
+      ``LAND_IS_EAST`` is the fallback sign when no reference is configured. This is
+      the local-normal cue the seaward envelope trusts when the per-scene water mask
+      can't resolve a transect (:func:`_resolve_seaward`).
     * **Any baseline topology** (:func:`_baseline_parts`): a single continuous
       ``LineString``, a deliberately gapped ``MultiLineString``, several disjoint
       features, endpoint-touching features (stitched into one run), or a mixed
@@ -2144,7 +2268,9 @@ def build_transects(
     records: List[dict] = []
     tid = 0
     for line in baseline_parts:
+        # First pass: sample points + local normals along this part.
         n = int(np.floor(line.length / spacing_m))
+        samples: List[Tuple[Point, float, float]] = []
         for i in range(n + 1):
             d = i * spacing_m
             p = line.interpolate(d)
@@ -2154,15 +2280,14 @@ def build_transects(
             tx, ty = (b.x - a.x), (b.y - a.y)
             norm = math.hypot(tx, ty) or 1.0
             tx, ty = tx / norm, ty / norm
-            nx, ny = -ty, tx  # a normal of the tangent
-            plus = Point(p.x + nx * length_m, p.y + ny * length_m)
-            if ref is not None:
-                minus = Point(p.x - nx * length_m, p.y - ny * length_m)
-                if ref.distance(minus) < ref.distance(plus):
-                    nx, ny = -nx, -ny  # -normal points more seaward
-            elif (nx > 0) == LAND_IS_EAST:  # last-resort default (land east -> sea west)
-                nx, ny = -nx, -ny
-            end = (p.x + nx * length_m, p.y + ny * length_m)
+            samples.append((p, -ty, tx))  # (point, normal_x, normal_y)
+        # ONE seaward sign for the whole part (not per vertex): a per-vertex
+        # distance-to-a-single-point test flips erratically where the coast bends
+        # away from the reference (Teknaf's hook), stitching inland points. A
+        # per-part sign keeps the outward normal consistent as the baseline curves.
+        sign = _seaward_sign(samples, ref)
+        for (p, nx, ny) in samples:
+            end = (p.x + sign * nx * length_m, p.y + sign * ny * length_m)
             records.append({
                 "transect_id": tid,
                 "geometry": LineString([(p.x, p.y), end]),  # vertex 0 = landward origin
