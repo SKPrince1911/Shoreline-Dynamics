@@ -36,6 +36,7 @@ import logging
 import math
 import os
 import urllib.request
+import warnings
 
 # EE's downloaded GeoTIFF tiles carry a band count that doesn't match a colour
 # interpretation, so GDAL/rasterio logs a harmless "Sum of Photometric ... and
@@ -1403,6 +1404,81 @@ def _as_line_list(geom) -> List[LineString]:
     return out
 
 
+def _safe_linemerge(geom):
+    """``linemerge`` that tolerates a lone ``LineString`` (shapely raises on one).
+
+    ``shapely.ops.linemerge`` requires a ``MultiLineString`` / collection and
+    raises ``ValueError`` on a bare ``LineString``. ``unary_union`` collapses a
+    single-reach input to exactly that, so callers that union-then-linemerge crash
+    whenever only one reach survives. This returns such an input unchanged (a lone
+    line is already 'merged') and is otherwise identical to ``linemerge`` — so the
+    normal multi-reach result is bit-for-bit the same.
+    """
+    if geom is None or geom.is_empty or isinstance(geom, LineString):
+        return geom
+    return linemerge(geom)
+
+
+def _baseline_parts(geom) -> List[LineString]:
+    """Normalise ANY baseline geometry to a flat list of stitched LineString parts.
+
+    :func:`build_transects` accepts whatever topology the operator digitised — a
+    lone ``LineString``, a gapped ``MultiLineString`` (broken at estuary mouths),
+    several disjoint ``LineString`` features, touching features that should stitch
+    into one run, or a mixed ``GeometryCollection``. ``shapely.ops.linemerge``
+    stitches parts that share endpoints but RAISES on a bare ``LineString``, so it
+    is only ever called here on a ``MultiLineString`` — every branch is guarded.
+
+    Parts that don't touch (deliberate gaps) survive as separate parts, so a
+    continuous baseline yields one part and a broken one yields several; the
+    transect caster then simply never crosses a gap. Degenerate members (points,
+    empty geometries, <2 coords, zero length) are dropped, never raised on.
+
+    Args:
+        geom: The result of ``unary_union`` over the baseline geometries (a
+            ``LineString``/``MultiLineString``/``GeometryCollection``), or ``None``.
+
+    Returns:
+        A flat list of castable ``LineString`` parts (possibly empty).
+    """
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, LineString):
+        parts = [geom]
+    elif isinstance(geom, MultiLineString):
+        parts = _as_line_list(linemerge(geom))  # stitch endpoint-touching pieces
+    else:
+        # GeometryCollection / mixed: keep only the line members, re-union to
+        # stitch anything touching, then recurse on the result (a LineString or
+        # MultiLineString) so linemerge stays guarded against a bare LineString.
+        line_members = [
+            g for g in getattr(geom, "geoms", [])
+            if isinstance(g, (LineString, MultiLineString)) and not g.is_empty
+        ]
+        if not line_members:
+            return []
+        parts = _baseline_parts(unary_union(line_members))
+    # Only parts with >=2 distinct coords and non-zero length can be cast along.
+    return [ln for ln in parts if len(ln.coords) >= 2 and ln.length > 0.0]
+
+
+def _empty_transects(write: bool) -> "gpd.GeoDataFrame":
+    """An empty (but well-formed) transect GeoDataFrame in EPSG:4326.
+
+    Returned when a baseline normalises to zero usable parts, so callers get a
+    valid empty layer instead of an exception. Written to ``TRANSECTS_PATH`` when
+    ``write`` so the caching in :func:`_load_or_build_transects` still has a file.
+    """
+    out = gpd.GeoDataFrame(
+        {"transect_id": pd.Series([], dtype="int64"), "geometry": []},
+        geometry="geometry", crs=config.STORAGE_CRS,
+    )
+    if write:
+        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+        out.to_file(TRANSECTS_PATH, driver="GeoJSON")
+    return out
+
+
 def filter_contours(
     contours: List[LineString],
     search_zone: Optional[Polygon],
@@ -1466,7 +1542,7 @@ def filter_contours(
     # Splice channel closures BEFORE merging so mouth-bridging segments join the
     # adjacent reaches; only THEN drop short *merged* reaches.
     parts = _apply_channel_closures(parts, channel_lines)
-    merged = linemerge(unary_union(parts))
+    merged = _safe_linemerge(unary_union(parts))  # tolerate a single surviving reach
     ordered = [ln for ln in _as_line_list(merged) if ln.length >= min_length_m]
     if not ordered:
         return None
@@ -1722,13 +1798,22 @@ def _apply_channel_closures(
 def _load_or_build_transects() -> Optional["gpd.GeoDataFrame"]:
     """Transects in EPSG:32646 for the seaward envelope, or ``None`` if unavailable.
 
-    Loads ``outputs/transects.geojson`` if present; else builds it from
-    ``data/baseline.geojson`` if that exists; else returns ``None`` (no baseline
-    digitised yet).
+    Caches: reuses ``outputs/transects.geojson`` when it exists and is at least as
+    new as the baseline; rebuilds only when the cached file is missing or the
+    baseline has been re-uploaded since (mtime check). Returns ``None`` when no
+    baseline has been digitised yet.
     """
-    if os.path.exists(TRANSECTS_PATH):
+    have_transects = os.path.exists(TRANSECTS_PATH)
+    have_baseline = os.path.exists(BASELINE_PATH)
+    if have_transects:
+        stale = (
+            have_baseline
+            and os.path.getmtime(BASELINE_PATH) > os.path.getmtime(TRANSECTS_PATH)
+        )
+        if stale:
+            build_transects()  # baseline is newer -> regenerate the cache
         return load_transects()
-    if os.path.exists(BASELINE_PATH):
+    if have_baseline:
         build_transects()  # writes outputs/transects.geojson (EPSG:4326)
         return load_transects()  # reprojected to EPSG:32646
     return None
@@ -2014,10 +2099,16 @@ def build_transects(
       not face west (Teknaf's hook, Shah Porir Dwip). ``LAND_IS_EAST`` is only a
       last-resort default if no reference is configured. (The per-scene water mask
       refines this further at extraction, in :func:`seaward_envelope`.)
-    * **Multi-part / gapped baseline**: a ``MultiLineString`` baseline is handled
-      by casting along each existing segment and NEVER across a gap — so breaking
-      the baseline at the Naf and Bakkhali estuary mouths excludes those reaches,
-      while ``transect_id`` stays continuous and ordered alongshore.
+    * **Any baseline topology** (:func:`_baseline_parts`): a single continuous
+      ``LineString``, a deliberately gapped ``MultiLineString``, several disjoint
+      features, endpoint-touching features (stitched into one run), or a mixed
+      ``GeometryCollection`` all work. Transects are cast along each part
+      independently and NEVER across a gap — so breaking the baseline at the Naf
+      and Bakkhali estuary mouths excludes those reaches, while a continuous line
+      is simply one gap-free part. ``transect_id`` stays continuous and ordered
+      alongshore across all parts. Degenerate parts (points, empty, zero-length)
+      are skipped; a baseline with no usable parts returns an empty transect set
+      with a warning rather than raising.
 
     Args:
         baseline_path: Path to the digitised baseline GeoJSON (EPSG:4326).
@@ -2026,15 +2117,28 @@ def build_transects(
         write: Write ``outputs/transects.geojson`` (EPSG:4326) when True.
 
     Returns:
-        A ``GeoDataFrame`` of transects in EPSG:4326 with ``transect_id``.
+        A ``GeoDataFrame`` of transects in EPSG:4326 with ``transect_id`` (empty
+        when the baseline has no usable LineString parts).
     """
     gdf = gpd.read_file(baseline_path).to_crs(config.METRIC_CRS)
-    # linemerge only stitches segments that share endpoints, so deliberate gaps
-    # in a MultiLineString baseline survive as separate parts (no cross-gap cast).
-    base = linemerge(unary_union(list(gdf.geometry)))
-    baseline_parts = _as_line_list(base)
+    # Normalise WHATEVER topology the file holds — a single LineString, a gapped
+    # MultiLineString, several disjoint or endpoint-touching features, or a mixed
+    # GeometryCollection — to a flat list of stitched LineString parts.
+    # ``unary_union`` dissolves/nodes coincident input; ``_baseline_parts`` then
+    # linemerges touching pieces (guarded: never called on a bare LineString) while
+    # deliberate gaps survive as separate parts, so a break at an estuary mouth
+    # excludes that reach and a continuous line is simply one gap-free part.
+    geoms = [g for g in gdf.geometry if g is not None and not g.is_empty]
+    union = unary_union(geoms) if geoms else None
+    baseline_parts = _baseline_parts(union)
     if not baseline_parts:
-        raise ValueError(f"{baseline_path} has no LineString baseline")
+        warnings.warn(
+            f"{baseline_path} yielded no usable LineString parts after "
+            "normalisation — returning an empty transect set (envelope mode will "
+            "fall back to raw).",
+            RuntimeWarning, stacklevel=2,
+        )
+        return _empty_transects(write)
     ref = _seaward_reference_utm()
 
     records: List[dict] = []
@@ -2084,7 +2188,13 @@ def load_transects(path: str = TRANSECTS_PATH) -> "gpd.GeoDataFrame":
         raise FileNotFoundError(
             f"{path} not found — run build_transects() (needs data/baseline.geojson)"
         )
-    return gpd.read_file(path).to_crs(config.METRIC_CRS)
+    gdf = gpd.read_file(path)
+    if gdf.empty:
+        # An empty transect layer (degenerate baseline) has no geometries to
+        # transform; give it the metric CRS without a reprojection that would
+        # raise on a naive/empty frame.
+        return gdf.set_crs(config.METRIC_CRS, allow_override=True)
+    return gdf.to_crs(config.METRIC_CRS)
 
 
 def _transect_crossings(line, transect, origin) -> List[float]:
