@@ -130,6 +130,13 @@ MODELS_DIR: str = "models"
 DRIVE_MOUNT: str = "/content/drive/MyDrive"
 DRIVE_MODELS_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/models"
 
+# Slow-to-compute artifacts (the dense Series B scene list — hundreds of EE
+# queries — the annual list, and the transects) are cached to Google Drive when it
+# is mounted so they SURVIVE a runtime restart and load in seconds next session,
+# falling back to the local repo ``outputs/``. Reads look Drive-first, then local.
+# <-- TUNABLE (path)
+DRIVE_CACHE_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/cache"
+
 # Streamed training fetches each source scene over just the bbox of ITS OWN
 # labelled polygons (buffered by this, for the 3x3 texture halo), not the whole
 # search-zone bbox — training polygons are localised, so this keeps each training
@@ -178,6 +185,128 @@ def model_exists(
 ) -> bool:
     """Whether a trained model exists on Drive or locally (for skip-if-trained)."""
     return find_model(sensor_group, version) is not None
+
+
+# ---------------------------------------------------------------------------
+# Drive-backed cache for slow artifacts (dense/annual scene lists, transects)
+# ---------------------------------------------------------------------------
+def _drive_cache_dir() -> Optional[str]:
+    """The Drive cache dir if Drive is mounted, else ``None``."""
+    return DRIVE_CACHE_DIR if os.path.isdir(DRIVE_MOUNT) else None
+
+
+def _cache_read_path(filename: str) -> Optional[str]:
+    """First existing cached copy of ``filename`` — Drive cache, then local
+    ``outputs/`` — or ``None`` if neither exists."""
+    dirs = ([_drive_cache_dir()] if _drive_cache_dir() else []) + [config.OUTPUT_DIR]
+    for d in dirs:
+        path = os.path.join(d, filename)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _persist_cache_file(src_path: str, filename: str) -> None:
+    """Copy a just-written local cache file into the Drive cache too (if mounted)."""
+    dd = _drive_cache_dir()
+    if dd is None or not os.path.exists(src_path):
+        return
+    os.makedirs(dd, exist_ok=True)
+    dst = os.path.join(dd, filename)
+    if os.path.abspath(src_path) != os.path.abspath(dst):
+        import shutil
+        shutil.copy2(src_path, dst)
+
+
+def _persist_cache_df(df: pd.DataFrame, filename: str) -> str:
+    """Write ``df`` to the local ``outputs/`` cache AND (if mounted) the Drive cache.
+
+    Returns the primary (Drive if mounted, else local) path written.
+    """
+    local = os.path.join(config.OUTPUT_DIR, filename)
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    df.to_csv(local, index=False)
+    _persist_cache_file(local, filename)
+    return os.path.join(_drive_cache_dir(), filename) if _drive_cache_dir() else local
+
+
+# Cache file names + the columns a cached scene list MUST carry to be trusted.
+DENSE_CACHE_NAME: str = "scene_list_dense.csv"
+ANNUAL_CACHE_NAME: str = "scene_list_annual.csv"
+_DENSE_REQUIRED_COLS: List[str] = [
+    "image_id", "sensor", "acq_datetime_utc", "dry_year", "series",
+    "aoi_cloud_pct", "aoi_coverage_pct", "season_complete",
+]
+_ANNUAL_REQUIRED_COLS: List[str] = [
+    "image_id", "sensor", "acq_datetime_utc", "dry_year", "season_label", "series",
+]
+
+
+def _read_valid_cached_list(
+    filename: str, required_cols: List[str]
+) -> Optional[pd.DataFrame]:
+    """Load a cached scene-list CSV if present, non-empty, and schema-valid, else None.
+
+    Warns (and returns None, forcing a rebuild) when a cache file exists but is
+    unreadable, empty, or missing a required column.
+    """
+    path = _cache_read_path(filename)
+    if path is None:
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:  # corrupt / unreadable
+        warnings.warn(f"cached {filename} at {path} unreadable ({exc}) -> rebuilding",
+                      RuntimeWarning, stacklevel=2)
+        return None
+    missing = [c for c in required_cols if c not in df.columns]
+    if df.empty or missing:
+        warnings.warn(
+            f"cached {filename} at {path} is "
+            + ("empty" if df.empty else f"missing columns {missing}")
+            + " -> rebuilding", RuntimeWarning, stacklevel=2,
+        )
+        return None
+    print(f"loaded {filename} from cache ({len(df)} scenes) <- {path}", flush=True)
+    return df
+
+
+def get_scene_list_annual(
+    force_rebuild: bool = False,
+    inventory_csv: str = "outputs/image_inventory.csv",
+) -> pd.DataFrame:
+    """Series A annual scene list from cache (Drive/local) or rebuilt from the inventory.
+
+    Returns the cached ``scene_list_annual.csv`` when present and schema-valid
+    (no work), else explodes the Phase-1 inventory (:func:`build_scene_list_annual`)
+    and caches the result to Drive + local. ``force_rebuild`` ignores the cache.
+    """
+    if not force_rebuild:
+        cached = _read_valid_cached_list(ANNUAL_CACHE_NAME, _ANNUAL_REQUIRED_COLS)
+        if cached is not None:
+            return cached
+    df = build_scene_list_annual(inventory_csv)
+    _persist_cache_df(df, ANNUAL_CACHE_NAME)
+    return df
+
+
+def get_scene_list_dense(force_rebuild: bool = False, **kwargs) -> pd.DataFrame:
+    """Series B dense scene list from cache (Drive/local) or rebuilt via Earth Engine.
+
+    The dense query hits EE for hundreds of scenes and is slow (minutes to hours),
+    so this returns the cached ``scene_list_dense.csv`` when present and schema-valid
+    WITHOUT touching EE. It rebuilds (:func:`build_scene_list_dense`, ``**kwargs``
+    forwarded) only when the cache is missing, invalid, or ``force_rebuild=True``,
+    then persists to Drive + local so future sessions load in seconds.
+    """
+    if not force_rebuild:
+        cached = _read_valid_cached_list(DENSE_CACHE_NAME, _DENSE_REQUIRED_COLS)
+        if cached is not None:
+            return cached
+    print("building dense list (slow, one-time EE query)...", flush=True)
+    df = build_scene_list_dense(write_csv=True, **kwargs)  # writes local outputs
+    _persist_cache_df(df, DENSE_CACHE_NAME)
+    return df
 
 # Output locations (D-locked schema, PHASE2_SPEC.md §3).
 SHORELINE_DIR: str = os.path.join(config.OUTPUT_DIR, "shorelines")
@@ -1847,6 +1976,7 @@ def _empty_transects(write: bool) -> "gpd.GeoDataFrame":
     if write:
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
         out.to_file(TRANSECTS_PATH, driver="GeoJSON")
+        _persist_cache_file(TRANSECTS_PATH, "transects.geojson")  # -> Drive cache
     return out
 
 
@@ -2261,24 +2391,25 @@ def _apply_channel_closures(
 def _load_or_build_transects() -> Optional["gpd.GeoDataFrame"]:
     """Transects in EPSG:32646 for the seaward envelope, or ``None`` if unavailable.
 
-    Caches: reuses ``outputs/transects.geojson`` when it exists and is at least as
-    new as the baseline; rebuilds only when the cached file is missing or the
-    baseline has been re-uploaded since (mtime check). Returns ``None`` when no
-    baseline has been digitised yet.
+    Caches to Drive (then local ``outputs/``): reuses the cached
+    ``transects.geojson`` when it exists and is at least as new as the baseline;
+    rebuilds only when the cache is missing or the baseline has been re-uploaded
+    since (mtime check). Returns ``None`` when no baseline has been digitised yet.
     """
-    have_transects = os.path.exists(TRANSECTS_PATH)
+    cached = _cache_read_path("transects.geojson")  # Drive first, then local outputs
     have_baseline = os.path.exists(BASELINE_PATH)
-    if have_transects:
+    if cached is not None:
         stale = (
             have_baseline
-            and os.path.getmtime(BASELINE_PATH) > os.path.getmtime(TRANSECTS_PATH)
+            and os.path.getmtime(BASELINE_PATH) > os.path.getmtime(cached)
         )
         if stale:
             build_transects()  # baseline is newer -> regenerate the cache
-        return load_transects()
+            cached = _cache_read_path("transects.geojson") or cached
+        return load_transects(cached)
     if have_baseline:
-        build_transects()  # writes outputs/transects.geojson (EPSG:4326)
-        return load_transects()  # reprojected to EPSG:32646
+        build_transects()  # writes outputs/ + Drive cache (EPSG:4326)
+        return load_transects(_cache_read_path("transects.geojson") or TRANSECTS_PATH)
     return None
 
 
@@ -2723,16 +2854,19 @@ def build_transects(
     if write:
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
         out.to_file(TRANSECTS_PATH, driver="GeoJSON")
+        _persist_cache_file(TRANSECTS_PATH, "transects.geojson")  # -> Drive cache
     return out
 
 
-def load_transects(path: str = TRANSECTS_PATH) -> "gpd.GeoDataFrame":
-    """Load ``outputs/transects.geojson`` reprojected to EPSG:32646 (metric).
+def load_transects(path: Optional[str] = None) -> "gpd.GeoDataFrame":
+    """Load the cached ``transects.geojson`` reprojected to EPSG:32646 (metric).
 
-    The benchmark and inter-sensor bias measure distances along transects, so
-    they need them in the metric CRS. Build them first with
-    :func:`build_transects`.
+    With no ``path`` the cache is resolved Drive-first, then local ``outputs/``.
+    The benchmark and inter-sensor bias measure distances along transects, so they
+    need them in the metric CRS. Build them first with :func:`build_transects`.
     """
+    if path is None:
+        path = _cache_read_path("transects.geojson") or TRANSECTS_PATH
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"{path} not found — run build_transects() (needs data/baseline.geojson)"
