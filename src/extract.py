@@ -67,6 +67,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
 import joblib
 
 from . import config, data
@@ -128,6 +129,12 @@ DEFAULT_CLASSIFIER_VERSION: str = "v1"
 MODELS_DIR: str = "models"
 DRIVE_MOUNT: str = "/content/drive/MyDrive"
 DRIVE_MODELS_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/models"
+
+# Streamed training fetches each source scene over just the bbox of ITS OWN
+# labelled polygons (buffered by this, for the 3x3 texture halo), not the whole
+# search-zone bbox — training polygons are localised, so this keeps each training
+# scene small in RAM.  <-- TUNABLE
+TRAINING_REGION_BUFFER_M: float = 300.0
 
 
 def _drive_models_dir() -> Optional[str]:
@@ -1120,39 +1127,256 @@ def build_training_set(
     Returns:
         ``(X, y)`` with ``X`` shape ``(N, 20)`` and integer ``y`` in {0,1,2,3}.
     """
-    gdf = gpd.read_file(labels_path).to_crs(config.METRIC_CRS)
-    if "class" not in gdf.columns:
-        raise ValueError(f"{labels_path} has no 'class' column")
+    gdf = _training_gdf(labels_path)
     xs: List[np.ndarray] = []
     ys: List[np.ndarray] = []
     for scene in scenes:
-        # Burn every labelled polygon into one class-code raster (last polygon
-        # wins on overlap), then extract features once for all labelled pixels —
-        # no full-scene feature cube is built.
-        class_map = np.full(scene.valid.shape, -1, dtype=np.int16)
-        for _, poly in gdf.iterrows():
-            if poly.geometry is None or poly.geometry.is_empty:
-                continue
-            code = _class_code(poly["class"])
-            burned = rio_features.rasterize(
-                [(mapping(poly.geometry), 1)],
-                out_shape=scene.valid.shape,
-                transform=scene.transform,
-                fill=0,
-                dtype="uint8",
-            ).astype(bool)
-            class_map[burned & scene.valid] = code
-        sample = class_map >= 0
-        if not sample.any():
-            continue
-        xs.append(_feature_matrix(scene, sample))
-        ys.append(class_map[sample].astype(int))
+        X, y = _sample_scene_polys(scene, gdf)
+        if X.shape[0]:
+            xs.append(X)
+            ys.append(y)
     if not xs:
         raise ValueError(
             "no training pixels sampled — check that training polygons overlap "
             "the provided scenes and fall inside their valid data"
         )
-    return np.vstack(xs), np.concatenate(ys)
+    return np.vstack(xs).astype(np.float32), np.concatenate(ys)
+
+
+def _training_gdf(labels_path: str) -> "gpd.GeoDataFrame":
+    """Load the training polygons reprojected to EPSG:32646, validating ``class``."""
+    gdf = gpd.read_file(labels_path).to_crs(config.METRIC_CRS)
+    if "class" not in gdf.columns:
+        raise ValueError(f"{labels_path} has no 'class' column")
+    return gdf
+
+
+def _has_src_cols(gdf: "gpd.GeoDataFrame") -> bool:
+    """Whether the polygons carry ``src_year`` + ``src_sensor`` (scene provenance)."""
+    return "src_year" in gdf.columns and "src_sensor" in gdf.columns
+
+
+def _sample_scene_polys(
+    scene: Scene, gdf: "gpd.GeoDataFrame"
+) -> Tuple[np.ndarray, np.ndarray]:
+    """``(X float32, y)`` feature rows for one scene under the polygons in ``gdf``.
+
+    Burns every polygon into a class-code raster (last wins on overlap) and pulls
+    the 20-feature vectors of the covered valid pixels via the row-blocked
+    :func:`_feature_matrix`. No full-scene feature cube is built.
+    """
+    class_map = np.full(scene.valid.shape, -1, dtype=np.int16)
+    for _, poly in gdf.iterrows():
+        if poly.geometry is None or poly.geometry.is_empty:
+            continue
+        code = _class_code(poly["class"])
+        burned = rio_features.rasterize(
+            [(mapping(poly.geometry), 1)],
+            out_shape=scene.valid.shape,
+            transform=scene.transform,
+            fill=0,
+            dtype="uint8",
+        ).astype(bool)
+        class_map[burned & scene.valid] = code
+    sample = class_map >= 0
+    if not sample.any():
+        return np.empty((0, feats_dim()), dtype=np.float32), np.empty((0,), dtype=int)
+    X = _feature_matrix(scene, sample).astype(np.float32, copy=False)
+    y = class_map[sample].astype(int)
+    return X, y
+
+
+def training_polygon_summary(
+    labels_path: str = "data/training_polygons.geojson", min_polys: int = 3
+) -> pd.DataFrame:
+    """Training-polygon counts per (src_year, src_sensor, class); flag thin cells.
+
+    Groups by ``(src_year, src_sensor, class)`` when those provenance columns are
+    present (else by ``class`` only) and flags any cell with fewer than ``min_polys``
+    polygons as ``thin`` — a quick check that each labelled scene has enough of each
+    class before training.
+    """
+    gdf = _training_gdf(labels_path)
+    keys = [c for c in ("src_year", "src_sensor", "class") if c in gdf.columns]
+    if "class" not in keys:
+        keys.append("class")
+    out = gdf.groupby(keys).size().reset_index(name="n_polys")
+    out["thin"] = out["n_polys"] < min_polys
+    return out
+
+
+def training_scenes_for_group(
+    group: str,
+    scene_list: pd.DataFrame,
+    labels_path: str = "data/training_polygons.geojson",
+    max_fallback: int = 5,
+) -> pd.DataFrame:
+    """Scene-list ROWS to fetch to train ``group`` — one per source scene.
+
+    With ``src_year`` + ``src_sensor`` on the polygons, returns the ``scene_list``
+    rows matching each unique ``(src_year, src_sensor)`` whose sensor belongs to
+    ``group`` (so each polygon is later sampled on the scene it was digitised over).
+    Without those columns, falls back to the first ``max_fallback`` scenes of the
+    group's sensors. Returns an empty frame when the group has no polygons/scenes.
+    """
+    gdf = _training_gdf(labels_path)
+    sensors = [s for s, g in SENSOR_GROUP.items() if g == group]
+    if _has_src_cols(gdf):
+        pairs = gdf[["src_year", "src_sensor"]].dropna().drop_duplicates()
+        pairs = pairs[pairs["src_sensor"].astype(str).isin(sensors)]
+        rows: List[pd.Series] = []
+        for _, pr in pairs.iterrows():
+            match = scene_list[
+                (scene_list["dry_year"] == int(pr["src_year"]))
+                & (scene_list["sensor"].astype(str) == str(pr["src_sensor"]))
+            ]
+            if not match.empty:
+                rows.append(match.iloc[0])
+        return pd.DataFrame(rows).reset_index(drop=True) if rows else pd.DataFrame()
+    sub = scene_list[scene_list["sensor"].astype(str).isin(sensors)]
+    return sub.head(max_fallback).reset_index(drop=True)
+
+
+def build_training_set_streamed(
+    scene_rows: pd.DataFrame,
+    labels_path: str = "data/training_polygons.geojson",
+    region_utm: Optional[Polygon] = None,
+    tile_px: int = DEFAULT_TILE_PX,
+    buffer_m: float = TRAINING_REGION_BUFFER_M,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample training features ONE SCENE AT A TIME — bounded RAM (1a).
+
+    For each row: fetch the scene (over just the bbox of THAT scene's polygons,
+    buffered, unless ``region_utm`` is forced — so each training scene is small),
+    sample the polygons that belong to it (matched by ``src_year`` + ``src_sensor``
+    when present, else all polygons), accumulate the small float32 feature rows,
+    then ``del`` the scene + ``gc.collect()`` BEFORE the next fetch — never holding
+    more than one full scene. Peak RAM is printed per scene (1d).
+
+    Returns:
+        ``(X float32, y, src_keys)`` — ``src_keys`` marks the source scene of each
+        row so a caller can hold out a whole scene for evaluation.
+    """
+    gdf = _training_gdf(labels_path)
+    have_src = _has_src_cols(gdf)
+    xs: List[np.ndarray] = []
+    ys: List[np.ndarray] = []
+    keys: List[np.ndarray] = []
+    n = len(scene_rows)
+    for i, (_, row) in enumerate(scene_rows.iterrows(), start=1):
+        if have_src:
+            sub = gdf[
+                (gdf["src_year"] == int(row["dry_year"]))
+                & (gdf["src_sensor"].astype(str) == str(row["sensor"]))
+            ]
+        else:
+            sub = gdf
+        if sub.empty:
+            continue
+        if region_utm is not None:
+            region = region_utm
+        else:
+            minx, miny, maxx, maxy = sub.total_bounds
+            region = box(minx - buffer_m, miny - buffer_m, maxx + buffer_m, maxy + buffer_m)
+        scene = fetch_scene(row, tile_px=tile_px, region_utm=region)
+        X, y = _sample_scene_polys(scene, sub)
+        key = str(row.get("image_id") or f"{row.get('dry_year')}_{row.get('sensor')}")
+        del scene
+        gc.collect()
+        if X.shape[0]:
+            xs.append(X)
+            ys.append(y)
+            keys.append(np.full(y.shape[0], key, dtype=object))
+        if verbose:
+            cur, peak = _mem_mb()
+            print(f"  [train {i}/{n}] {key[:30]}: +{int(X.shape[0])} samples "
+                  f"| rss={cur:.0f} MB (peak {peak:.0f} MB)", flush=True)
+    if not xs:
+        return (np.empty((0, feats_dim()), dtype=np.float32),
+                np.empty((0,), dtype=int), np.empty((0,), dtype=object))
+    return (np.vstack(xs).astype(np.float32), np.concatenate(ys), np.concatenate(keys))
+
+
+def train_group(
+    group: str,
+    scene_list: pd.DataFrame,
+    labels_path: str = "data/training_polygons.geojson",
+    version: str = DEFAULT_CLASSIFIER_VERSION,
+    force_retrain: bool = False,
+    region_utm: Optional[Polygon] = None,
+    tile_px: int = DEFAULT_TILE_PX,
+    gate: float = 0.90,
+    verbose: bool = True,
+) -> dict:
+    """Train (or skip) one sensor group's classifier from its OWN scenes (streamed).
+
+    Skips with ``status='exists'`` when a Drive/local model is already present and
+    ``force_retrain`` is False (so a model from a previous session is reused, never
+    retrained), and with ``status='empty'`` when the group has no training polygons
+    or 0 sampled pixels. Otherwise streams the source scenes one at a time (1a),
+    trains, saves to Drive (:func:`train_classifier`), evaluates on a held-out scene
+    (or an 80/20 split for a single scene), and checks the ≥``gate`` precision/recall
+    bar for sand & water.
+
+    Returns:
+        A summary dict: ``{group, status, path, report?, n_train?, n_test?, gate?,
+        gate_pass?, eval?}``.
+    """
+    if not force_retrain and model_exists(group, version):
+        path = find_model(group, version)
+        if verbose:
+            print(f"{group}: model already at {path} -> skip "
+                  "(set FORCE_RETRAIN=True to retrain)")
+        return {"group": group, "status": "exists", "path": path}
+    rows = training_scenes_for_group(group, scene_list, labels_path)
+    if rows is None or rows.empty:
+        if verbose:
+            print(f"{group}: no training polygons/scenes -> skip")
+        return {"group": group, "status": "empty"}
+    if verbose:
+        print(f"{group}: training from {len(rows)} source scene(s), one at a time ...")
+    X, y, key = build_training_set_streamed(
+        rows, labels_path, region_utm=region_utm, tile_px=tile_px, verbose=verbose
+    )
+    if X.shape[0] == 0:
+        if verbose:
+            print(f"{group}: 0 training samples -> skip")
+        return {"group": group, "status": "empty"}
+    uniq, cnt = np.unique(y, return_counts=True)
+    if verbose:
+        print(f"{group}: {X.shape[0]} samples | per class "
+              f"{dict(zip(uniq.tolist(), cnt.tolist()))}")
+    scene_keys = list(dict.fromkeys(key.tolist()))
+    if len(scene_keys) >= 2:
+        te = key == scene_keys[-1]
+        Xtr, ytr, Xte, yte = X[~te], y[~te], X[te], y[te]
+        eval_desc = f"held-out scene {scene_keys[-1][:28]}"
+    else:
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=0)
+        eval_desc = "random 80/20 split (single source scene)"
+    clf = train_classifier(Xtr, ytr, group, version)  # fits + saves to Drive + prints
+    report = evaluate_classifier(clf, Xte, yte, write_report=True,
+                                 sensor_group=group, version=version)
+    metrics = classification_report(
+        yte, clf.predict(np.nan_to_num(Xte)),
+        labels=[config.CLASS_OTHER, config.CLASS_SAND, config.CLASS_WHITEWATER,
+                config.CLASS_WATER],
+        target_names=["other", "sand", "whitewater", "water"],
+        zero_division=0, output_dict=True,
+    )
+    gate_pass = all(
+        metrics[c]["precision"] >= gate and metrics[c]["recall"] >= gate
+        for c in ("sand", "water")
+    )
+    if verbose:
+        print(f"\n{group} evaluation ({eval_desc}):\n{report}")
+        print(f"{group} GATE (sand & water precision AND recall >= {gate:.2f}): "
+              + ("PASS" if gate_pass else
+                 "FAIL — add training polygons and re-run with FORCE_RETRAIN=True"))
+    return {"group": group, "status": "trained", "path": find_model(group, version),
+            "report": report, "n_train": int(Xtr.shape[0]), "n_test": int(Xte.shape[0]),
+            "gate": gate, "gate_pass": bool(gate_pass), "eval": eval_desc}
 
 
 def train_classifier(
