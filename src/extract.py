@@ -330,7 +330,7 @@ OUTPUT_SCHEMA: List[str] = [
     "aoi_coverage_pct", "slc_off", "composite_date_spread_days", "season_complete",
     "water_index", "threshold_method", "threshold_value", "classifier_version",
     "length_m", "n_vertices", "pct_aoi_alongshore_covered",
-    "envelope_n_multi", "seaward_methods", "flags",
+    "envelope_n_multi", "envelope_skipped_nodata", "seaward_methods", "flags",
 ]
 
 # Reusable CRS transformers (EPSG:4326 <-> EPSG:32646, always lon/lat order).
@@ -2051,11 +2051,12 @@ def filter_contours(
     merged_geom = ordered[0] if len(ordered) == 1 else MultiLineString(ordered)
 
     if mode == "envelope" and transects is not None:
-        env, n_multi, methods = seaward_envelope(
+        env, n_multi, skipped_nodata, methods = seaward_envelope(
             merged_geom, transects, watermask=watermask
         )
         if audit is not None:
             audit["envelope_n_multi"] = n_multi
+            audit["envelope_skipped_nodata"] = skipped_nodata
             audit["seaward_methods"] = methods
         return env if env is not None else merged_geom
     return merged_geom  # raw (or envelope with no transects) — bit-for-bit
@@ -2220,6 +2221,71 @@ def _crossing_points(line, transect) -> List[Point]:
     return pts
 
 
+# No-data gating for the seaward envelope (per-scene, stateless).
+ENVELOPE_VALID_HALO_PX: float = 1.5   # <-- TUNABLE: valid neighbourhood (px) each side of a crossing
+ENVELOPE_MIN_VALID_FRAC: float = 0.5  # <-- TUNABLE: a no-crossing transect below this valid-fraction is a no-data gap
+
+
+def _valid_at(pt: Point, transform: Affine, valid: np.ndarray) -> Optional[bool]:
+    """Sample ``scene.valid`` at a UTM point, or ``None`` if off-grid."""
+    col, row = (~transform) * (pt.x, pt.y)
+    r, c = int(round(row)), int(round(col))
+    h, w = valid.shape
+    if 0 <= r < h and 0 <= c < w:
+        return bool(valid[r, c])
+    return None
+
+
+def _crossing_on_valid(
+    pt: Point, tr: LineString, transform: Affine, valid: np.ndarray, px: float
+) -> bool:
+    """Whether a crossing is a genuine interface on VALID data, not a no-data edge.
+
+    Samples ``scene.valid`` at the crossing and a short neighbourhood
+    (``ENVELOPE_VALID_HALO_PX`` px) to either side ALONG the transect. A real
+    sand↔water crossing has valid land landward and valid water seaward, so the
+    whole neighbourhood is valid; a crossing at the edge of a no-data region has
+    invalid (or off-grid) pixels on one side and is rejected.
+    """
+    d0 = tr.project(pt)
+    length = tr.length
+    halo = ENVELOPE_VALID_HALO_PX * px
+    for off in (0.0, 0.5 * halo, -0.5 * halo, halo, -halo):
+        d = min(length, max(0.0, d0 + off))
+        if not _valid_at(tr.interpolate(d), transform, valid):  # None (off-grid) or False
+            return False
+    return True
+
+
+def _transect_valid_fraction(
+    tr: LineString, transform: Affine, valid: np.ndarray, px: float
+) -> float:
+    """Fraction of a transect's sampled pixels that are VALID (not no-data)."""
+    length = tr.length
+    if length <= 0:
+        return 0.0
+    step = px if px > 0 else 30.0
+    n = max(2, int(math.ceil(length / step)))
+    good = total = 0
+    for i in range(n + 1):
+        v = _valid_at(tr.interpolate(length * i / n), transform, valid)
+        if v is not None:
+            total += 1
+            good += int(v)
+    return good / total if total else 0.0
+
+
+def _unpack_watermask(
+    watermask: Optional[Tuple],
+) -> Tuple[Optional[np.ndarray], Optional[Affine], Optional[np.ndarray]]:
+    """Unpack ``(labels, transform[, valid])`` — tolerating the 2- or 3-tuple form."""
+    if watermask is None:
+        return None, None, None
+    if len(watermask) >= 3:
+        return watermask[0], watermask[1], watermask[2]
+    return watermask[0], watermask[1], None
+
+
 def seaward_envelope(
     merged_line,
     transects: "gpd.GeoDataFrame",
@@ -2253,19 +2319,29 @@ def seaward_envelope(
         merged_line: The merged shoreline geometry (EPSG:32646).
         transects: DSAS transects (EPSG:32646) with ``transect_id`` and a land->sea
             geometry (vertex 0 on the baseline).
-        watermask: Optional ``(labels, transform)`` from :func:`classify_scene` —
-            the per-scene class raster and its affine — the PRIMARY seaward cue.
-            When ``None`` the local baseline normal is used.
+        watermask: Optional ``(labels, transform)`` or ``(labels, transform, valid)``
+            from :func:`classify_scene` / the scene — the per-scene class raster, its
+            affine, and (when given) ``scene.valid``. ``labels`` is the PRIMARY
+            seaward cue; ``valid`` gates crossings on real (non-no-data) pixels.
         drop_loop_area_m2: Small-loop area threshold for the belt-and-braces drop.
 
+    **No-data (per-scene, stateless).** A crossing is only taken when it sits on
+    VALID data with a valid neighbourhood either side (:func:`_crossing_on_valid`),
+    so the edge of a no-data region (scene edge / SLC-off-style striping) is never
+    mistaken for a shoreline. The connecting line is BROKEN at any transect that
+    contributes no valid point (a ``MultiLineString``), so it never interpolates a
+    straight segment across a gap. The transect set is untouched — the same transect
+    contributes normally on scenes where it is valid.
+
     Returns:
-        ``(geometry, n_multi, methods)`` — a ``LineString``/``MultiLineString`` (or
-        ``None`` if fewer than two transects cross), the count of transects that
-        crossed more than once (recurved spits / complex mouths), and a ``methods``
-        tally: the resolution method per contributing transect
+        ``(geometry, n_multi, skipped_nodata, methods)`` — a ``LineString`` /
+        ``MultiLineString`` (or ``None`` if nothing survives), the count of transects
+        that crossed more than once (recurved spits / complex mouths),
+        ``skipped_nodata`` (transects dropped for this scene because their crossings
+        were no-data edges or they lie in a no-data gap), and a ``methods`` tally:
+        the resolution method per contributing transect
         (``watermask``/``baseline_normal``/``land_is_east``) plus the fall-through
-        reason breakdown (``fb_no_water``/``fb_no_sand``/``fb_tie``/``fb_no_labels``)
-        for the transects the water mask could not resolve.
+        reason breakdown (``fb_no_water``/``fb_no_sand``/``fb_tie``/``fb_no_labels``).
     """
     methods = {
         "watermask": 0, "baseline_normal": 0, "land_is_east": 0,
@@ -2275,34 +2351,58 @@ def seaward_envelope(
     if config.DROP_INTERIOR_LOOPS:
         parts = _drop_small_loops(parts, drop_loop_area_m2)
     if not parts:
-        return None, 0, methods
+        return None, 0, 0, methods
     work = unary_union(parts)
 
-    labels, transform = watermask if watermask is not None else (None, None)
+    labels, transform, valid = _unpack_watermask(watermask)
+    gate = valid is not None and transform is not None
+    px = abs(transform.a) if transform is not None else 30.0
 
     tdf = transects.sort_values("transect_id") \
         if "transect_id" in transects.columns else transects
-    seaward_pts: List[Point] = []
+    segments: List[List[Point]] = []   # runs of consecutive contributing transects
+    current: List[Point] = []
+    prev_ord: Optional[int] = None
     n_multi = 0
-    for _, t in tdf.iterrows():
+    skipped_nodata = 0
+    for ord_i, (_, t) in enumerate(tdf.iterrows()):
         tr = t.geometry
         if tr is None or tr.is_empty:
-            continue
+            continue  # missing transect -> breaks the run (ord gap below)
         pts = _crossing_points(work, tr)
-        if not pts:
-            continue
-        if len(pts) > 1:
-            n_multi += 1
-        _seaward_end, landward_end, method, reason = _resolve_seaward(tr, labels, transform)
-        # Most-seaward crossing = the one FARTHEST from the resolved landward end.
-        seaward_pts.append(max(pts, key=lambda p: p.distance(landward_end)))
-        methods[method] += 1
-        if reason:  # water mask fell through -> record why
-            methods[f"fb_{reason}"] = methods.get(f"fb_{reason}", 0) + 1
+        # Keep only crossings on valid data (reject no-data-edge artefacts).
+        good_pts = ([p for p in pts if _crossing_on_valid(p, tr, transform, valid, px)]
+                    if gate else pts)
+        if good_pts:
+            if len(good_pts) > 1:
+                n_multi += 1
+            _seaward_end, landward_end, method, reason = _resolve_seaward(tr, labels, transform)
+            seaward_pt = max(good_pts, key=lambda p: p.distance(landward_end))
+            # Break the line where this transect is not alongshore-adjacent to the
+            # previous contributor (a skipped/no-data transect sits between them).
+            if prev_ord is not None and ord_i != prev_ord + 1 and len(current) >= 2:
+                segments.append(current)
+                current = []
+            elif prev_ord is not None and ord_i != prev_ord + 1:
+                current = []
+            current.append(seaward_pt)
+            prev_ord = ord_i
+            methods[method] += 1
+            if reason:
+                methods[f"fb_{reason}"] = methods.get(f"fb_{reason}", 0) + 1
+        elif gate:
+            # No valid point this scene: count as no-data if crossings were rejected
+            # or the transect itself lies mostly in a no-data gap.
+            if pts or _transect_valid_fraction(tr, transform, valid, px) < ENVELOPE_MIN_VALID_FRAC:
+                skipped_nodata += 1
+    if len(current) >= 2:
+        segments.append(current)
 
-    if len(seaward_pts) < 2:
-        return None, n_multi, methods
-    return LineString([(p.x, p.y) for p in seaward_pts]), n_multi, methods
+    if not segments:
+        return None, n_multi, skipped_nodata, methods
+    lines = [LineString([(p.x, p.y) for p in seg]) for seg in segments]
+    geom = lines[0] if len(lines) == 1 else MultiLineString(lines)
+    return geom, n_multi, skipped_nodata, methods
 
 
 def seaward_debug(
@@ -2484,7 +2584,7 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         contours, settings.get("search_zone"), settings.get("channel_lines", []),
         settings.get("min_length_m", config.MIN_SHORELINE_LENGTH_M),
         mode=settings.get("mode"), transects=settings.get("transects"),
-        watermask=(labels, scene.transform), audit=audit,
+        watermask=(labels, scene.transform, scene.valid), audit=audit,
     )
     # labels (int16 whole-grid) and contours are no longer needed once the line
     # is built; free them so only scalars + geometry survive to the record.
@@ -2532,6 +2632,7 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         "n_vertices": n_vertices,
         "pct_aoi_alongshore_covered": min(100.0, 100.0 * length_m / AOI_ALONGSHORE_M),
         "envelope_n_multi": int(audit.get("envelope_n_multi", 0)),
+        "envelope_skipped_nodata": int(audit.get("envelope_skipped_nodata", 0)),
         "seaward_methods": _fmt_methods(audit.get("seaward_methods")),
         "flags": ",".join(flags),
         "geometry": geom_wgs,
