@@ -137,6 +137,12 @@ DRIVE_MODELS_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/models"
 # <-- TUNABLE (path)
 DRIVE_CACHE_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/cache"
 
+# Shoreline outputs (per-scene checkpoint + merged annual) are mirrored to Drive as
+# the batch runs so a mid-run disconnect on the long Series B run is recoverable and
+# resumable, and pushed to GitHub. Falls back to the local repo ``outputs/shorelines``.
+DRIVE_SHORELINES_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/shorelines"
+REPO_SLUG: str = "SKPrince1911/Shoreline-Dynamics"  # <-- TUNABLE (owner/repo for the GitHub push)
+
 # Streamed training fetches each source scene over just the bbox of ITS OWN
 # labelled polygons (buffered by this, for the 3x3 texture halo), not the whole
 # search-zone bbox — training polygons are localised, so this keeps each training
@@ -2488,29 +2494,39 @@ def _apply_channel_closures(
 # ===========================================================================
 # 2.6  Drivers
 # ===========================================================================
-def _load_or_build_transects() -> Optional["gpd.GeoDataFrame"]:
+def _load_or_build_transects(force_rebuild: bool = False) -> Optional["gpd.GeoDataFrame"]:
     """Transects in EPSG:32646 for the seaward envelope, or ``None`` if unavailable.
 
     Caches to Drive (then local ``outputs/``): reuses the cached
     ``transects.geojson`` when it exists and is at least as new as the baseline;
-    rebuilds only when the cache is missing or the baseline has been re-uploaded
-    since (mtime check). Returns ``None`` when no baseline has been digitised yet.
+    rebuilds when the cache is missing, the baseline has been re-uploaded since
+    (mtime check), or ``force_rebuild``. Returns ``None`` when no baseline has been
+    digitised yet.
     """
-    cached = _cache_read_path("transects.geojson")  # Drive first, then local outputs
     have_baseline = os.path.exists(BASELINE_PATH)
-    if cached is not None:
-        stale = (
-            have_baseline
-            and os.path.getmtime(BASELINE_PATH) > os.path.getmtime(cached)
-        )
-        if stale:
-            build_transects()  # baseline is newer -> regenerate the cache
-            cached = _cache_read_path("transects.geojson") or cached
-        return load_transects(cached)
-    if have_baseline:
+    cached = _cache_read_path("transects.geojson")  # Drive first, then local outputs
+    stale = (have_baseline and cached is not None
+             and os.path.getmtime(BASELINE_PATH) > os.path.getmtime(cached))
+    if have_baseline and (force_rebuild or cached is None or stale):
+        if stale and not force_rebuild:
+            print("data/baseline.geojson is newer than the cached transects "
+                  "-> rebuilding", flush=True)
         build_transects()  # writes outputs/ + Drive cache (EPSG:4326)
-        return load_transects(_cache_read_path("transects.geojson") or TRANSECTS_PATH)
-    return None
+        cached = _cache_read_path("transects.geojson") or TRANSECTS_PATH
+    if cached is None:
+        return None
+    return load_transects(cached)
+
+
+def get_transects(force_rebuild: bool = False) -> Optional["gpd.GeoDataFrame"]:
+    """Transects (EPSG:32646) from the Drive/local cache — the notebook entry point.
+
+    Rebuilds from ``data/baseline.geojson`` when the baseline is newer than the
+    cache (mtime) OR ``force_rebuild=True``. The 03b transects cell exposes
+    ``force_rebuild`` as ``FORCE_REBUILD_TRANSECTS`` so an edited/extended baseline
+    takes effect immediately. Returns ``None`` when no baseline exists yet.
+    """
+    return _load_or_build_transects(force_rebuild=force_rebuild)
 
 
 def default_settings(
@@ -2687,11 +2703,107 @@ def _mem_mb() -> Tuple[float, float]:
     return cur, peak
 
 
+# ---------------------------------------------------------------------------
+# Shoreline output persistence (Drive mirror + GitHub push)
+# ---------------------------------------------------------------------------
+def _drive_shorelines_dir() -> Optional[str]:
+    """The Drive shorelines dir if Drive is mounted, else ``None``."""
+    return DRIVE_SHORELINES_DIR if os.path.isdir(DRIVE_MOUNT) else None
+
+
+def _shoreline_out_paths(filename: str) -> List[str]:
+    """Destinations for a shoreline output: local ``outputs/shorelines`` (for the
+    GitHub push) plus the Drive mirror when mounted (durable checkpoint)."""
+    paths = [os.path.join(SHORELINE_DIR, filename)]
+    dd = _drive_shorelines_dir()
+    if dd is not None:
+        paths.append(os.path.join(dd, filename))
+    return paths
+
+
+def push_outputs_to_github(
+    message: str, add_path: str = config.OUTPUT_DIR, repo_slug: str = REPO_SLUG
+) -> str:
+    """Commit + push ``add_path`` to GitHub ``main`` using the ``GITHUB_TOKEN`` secret.
+
+    The token is read only from Colab ``userdata`` — never printed or written to a
+    file (the auth URL is a one-off push arg, and the token is masked from any error).
+    Returns a short status string (``'pushed to origin/main'`` / ``'no changes'`` /
+    ``'skipped (no GITHUB_TOKEN)'`` / ``'FAILED: …'``).
+    """
+    import subprocess
+
+    def _git(*args):
+        return subprocess.run(["git", *args], capture_output=True, text=True)
+
+    try:
+        from google.colab import userdata
+        token = userdata.get("GITHUB_TOKEN")
+    except Exception:
+        token = None
+    if not token:
+        print("GITHUB_TOKEN secret not found -> skipping GitHub push (Colab Secrets: "
+              "add GITHUB_TOKEN with repo write, Notebook access ON).", flush=True)
+        return "skipped (no GITHUB_TOKEN)"
+    if not _git("config", "user.email").stdout.strip():
+        _git("config", "user.email", "colab-shoreline@users.noreply.github.com")
+    if not _git("config", "user.name").stdout.strip():
+        _git("config", "user.name", "Colab Shoreline Bot")
+    auth_url = f"https://x-access-token:{token}@github.com/{repo_slug}.git"
+    _git("add", add_path)
+    if _git("diff", "--cached", "--quiet").returncode == 0:
+        return "no changes"
+    _git("commit", "-m", message)
+    push = _git("push", auth_url, "HEAD:main")
+    if push.returncode != 0:
+        pull = _git("pull", "--rebase", auth_url, "main")
+        if pull.returncode != 0:
+            _git("rebase", "--abort")
+            return "FAILED: pull --rebase conflict; resolve manually"
+        push = _git("push", auth_url, "HEAD:main")
+    if push.returncode == 0:
+        return "pushed to origin/main"
+    return "FAILED: " + push.stderr.replace(token, "***").strip()[:200]
+
+
+def persist_shoreline_outputs(
+    scenes_gdf: Optional["gpd.GeoDataFrame"] = None,
+    merged_gdf: Optional["gpd.GeoDataFrame"] = None,
+    push: bool = True,
+    message: Optional[str] = None,
+) -> Dict[str, object]:
+    """Persist shoreline outputs to local ``outputs/`` + Drive, and push to GitHub.
+
+    Writes ``sds_scenes.geojson`` (``scenes_gdf``) and ``sds_annual_merged.geojson``
+    (``merged_gdf``) to the local repo ``outputs/shorelines`` (so the GitHub push
+    picks them up) AND the Drive mirror (so they survive a restart), printing each
+    resolved path. When ``push`` and a ``GITHUB_TOKEN`` secret is present, commits +
+    pushes ``outputs/`` to ``main``. Returns ``{"written": [...], "push": status}``.
+    """
+    written: List[str] = []
+    for gdf, name in ((scenes_gdf, "sds_scenes.geojson"),
+                      (merged_gdf, "sds_annual_merged.geojson")):
+        if gdf is None or len(gdf) == 0:
+            continue
+        for path in _shoreline_out_paths(name):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            gdf.to_file(path, driver="GeoJSON")
+            print("wrote", path, flush=True)
+            written.append(path)
+    status = None
+    if push:
+        if message is None:
+            message = f"Update shoreline outputs @ {datetime.now(timezone.utc).isoformat()}"
+        status = push_outputs_to_github(message)
+        print("GitHub push:", status, flush=True)
+    return {"written": written, "push": status}
+
+
 def extract_all(
     scene_list: pd.DataFrame,
     settings: dict,
     classifiers: Optional[Dict[str, Pipeline]] = None,
-    checkpoint_path: str = SDS_SCENES_PATH,
+    checkpoint_path: Optional[str] = None,
     log_path: str = EXTRACTION_LOG_PATH,
     resume: bool = True,
     tile_px: int = DEFAULT_TILE_PX,
@@ -2701,35 +2813,51 @@ def extract_all(
 
     Series-agnostic: works on either scene list. For each row it fetches the
     scene, picks the sensor-group classifier, extracts the shoreline, and appends
-    the record — rewriting ``checkpoint_path`` (``sds_scenes.geojson``) after
-    EVERY scene so a Colab disconnect over the ~600–900 dense scenes never loses
-    completed work. Failures are logged to ``extraction_log.csv`` (one row per
-    scene attempted, with the reason) and skipped. With ``resume`` the already
-    completed ``image_id``s in an existing checkpoint are not recomputed.
+    the record — rewriting the ``sds_scenes.geojson`` checkpoint after EVERY scene
+    to the local ``outputs/shorelines`` AND (when Drive is mounted) the Drive
+    mirror, so a disconnect over the ~600–900 dense scenes never loses completed
+    work and the run resumes from the durable Drive copy. Failures are logged to
+    ``extraction_log.csv`` and skipped. With ``resume`` the already-completed
+    ``image_id``s in an existing checkpoint are not recomputed.
 
     Args:
         scene_list: Output of ``build_scene_list_annual``/``_dense``.
         settings: From :func:`default_settings`.
         classifiers: ``{sensor_group: pipeline}``; loaded from ``models/`` when
             omitted.
-        checkpoint_path / log_path: Output paths.
+        checkpoint_path: Override the checkpoint file (default: local + Drive
+            ``sds_scenes.geojson``). log_path: extraction log.
         resume: Skip scenes already present in the checkpoint.
 
     Returns:
         A ``GeoDataFrame`` (EPSG:4326) of all extracted shorelines.
     """
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    if checkpoint_path is None:
+        checkpoint_paths = _shoreline_out_paths("sds_scenes.geojson")
+    else:
+        checkpoint_paths = [checkpoint_path]
+        dd = _drive_shorelines_dir()
+        if dd is not None:
+            checkpoint_paths.append(os.path.join(dd, os.path.basename(checkpoint_path)))
+    for p in checkpoint_paths:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+    if verbose:
+        print("checkpoint ->", ", ".join(checkpoint_paths), flush=True)
     version = settings.get("classifier_version", DEFAULT_CLASSIFIER_VERSION)
 
     records: List[dict] = []
     done: set = set()
-    if resume and os.path.exists(checkpoint_path):
-        prev = gpd.read_file(checkpoint_path)
+    # Resume from the durable (Drive) copy first, else the local one.
+    resume_path = next((p for p in reversed(checkpoint_paths) if os.path.exists(p)), None)
+    if resume and resume_path:
+        prev = gpd.read_file(resume_path)
         for _, r in prev.iterrows():
             rec = r.drop(labels="geometry").to_dict()
             rec["geometry"] = r.geometry
             records.append(rec)
             done.add(rec.get("image_id"))
+        if verbose:
+            print(f"resuming: {len(done)} scenes already done <- {resume_path}", flush=True)
 
     clf_cache: Dict[str, Pipeline] = dict(classifiers or {})
     n_total = len(scene_list)
@@ -2746,7 +2874,7 @@ def extract_all(
             scene = _attach_row_metadata(scene, row)
             record = extract_shoreline(scene, clf_cache[group], settings)
             records.append(record)
-            _write_checkpoint(records, checkpoint_path)
+            _write_checkpoint(records, checkpoint_paths)
             # Drop the scene's pixel arrays before the next fetch so RAM doesn't
             # accumulate across the ~829 dense scenes. The record holds only scalars
             # + a shapely geometry (no arrays), so nothing pins the grid.
@@ -2781,12 +2909,17 @@ def _records_to_gdf(records: List[dict]) -> "gpd.GeoDataFrame":
     return gdf[cols]
 
 
-def _write_checkpoint(records: List[dict], path: str) -> None:
-    """Persist all records so far to a GeoJSON checkpoint (called every scene)."""
+def _write_checkpoint(records: List[dict], paths) -> None:
+    """Persist all records so far to each GeoJSON checkpoint path (called every scene).
+
+    ``paths`` is a single path or a list — the batch passes ``[local, Drive]`` so a
+    disconnect leaves a recoverable copy on Drive.
+    """
     gdf = _records_to_gdf([r for r in records if r.get("geometry") is not None])
     if len(gdf) == 0:
         return
-    gdf.to_file(path, driver="GeoJSON")
+    for path in ([paths] if isinstance(paths, str) else paths):
+        gdf.to_file(path, driver="GeoJSON")
 
 
 def _append_log(path: str, image_id: str, status: str, reason: str) -> None:
@@ -3051,6 +3184,44 @@ def _labels_all_interface(scene: Scene) -> np.ndarray:
     return labels
 
 
+def _reference_lookup(reference_shorelines: "gpd.GeoDataFrame"):
+    """Build a ``scene -> reference geometry`` matcher for the benchmark.
+
+    Primary: match on ``(src_year, src_sensor)`` — the scene's dry-year
+    (:func:`assign_dry_year`) and sensor — unioning all reference lines that carry
+    the same key (a shoreline digitised as several segments). Fallback (when the
+    layer lacks those columns): match ``scene.image_id`` against an ``image_id``
+    column. Returns a function; missing matches return ``None``.
+    """
+    def _grouped(keyfn):
+        out: Dict[object, list] = {}
+        for _, r in reference_shorelines.iterrows():
+            geom = r.geometry
+            if geom is None or geom.is_empty:
+                continue
+            try:
+                key = keyfn(r)
+            except (KeyError, TypeError, ValueError):
+                continue
+            out.setdefault(key, []).append(geom)
+        return {k: unary_union(v) for k, v in out.items()}
+
+    if _has_src_cols(reference_shorelines):
+        by_key = _grouped(lambda r: (int(r["src_year"]), str(r["src_sensor"])))
+
+        def lookup(scene: Scene):
+            dy = assign_dry_year(pd.Timestamp(scene.acq_datetime_utc))
+            return by_key.get((dy, str(scene.sensor)))
+        return lookup
+
+    by_id = _grouped(lambda r: str(r["image_id"])) \
+        if "image_id" in reference_shorelines.columns else {}
+
+    def lookup(scene: Scene):
+        return by_id.get(str(scene.image_id))
+    return lookup
+
+
 def benchmark_extraction(
     scenes: List[Scene],
     reference_shorelines: "gpd.GeoDataFrame",
@@ -3065,10 +3236,12 @@ def benchmark_extraction(
     Evaluates ``index × threshold × classifier`` on the digitised reference
     scenes and reports, per sensor group, the transect-normal error (RMSE, mean
     bias, MAE) so the operational configuration can be selected and a paper
-    figure produced. Reference shorelines are matched to a scene by ``image_id``
-    (an ``image_id`` column on the reference layer). ``transects`` must be in
-    EPSG:32646; when omitted they are loaded from ``outputs/transects.geojson``
-    (build them once with :func:`build_transects`).
+    figure produced. Reference shorelines are matched to a scene by
+    ``(src_year, src_sensor)`` — the same convention as the training polygons,
+    resolved against the scene's dry-year (:func:`assign_dry_year`) and sensor —
+    falling back to an ``image_id`` column when those fields are absent
+    (:func:`_reference_lookup`). ``transects`` must be in EPSG:32646; when omitted
+    they are loaded from the transect cache (build them with :func:`build_transects`).
 
     Returns:
         A tidy DataFrame: one row per ``(sensor_group, water_index,
@@ -3078,9 +3251,7 @@ def benchmark_extraction(
     """
     if transects is None:
         transects = load_transects()
-    ref_by_id = {
-        str(r["image_id"]): r.geometry for _, r in reference_shorelines.iterrows()
-    }
+    ref_lookup = _reference_lookup(reference_shorelines)
     search_zone = load_search_zone()
     channel_lines = load_channel_lines_utm()
     rows: List[dict] = []
@@ -3089,7 +3260,7 @@ def benchmark_extraction(
             for method in threshold_methods:
                 acc: Dict[str, Dict[str, object]] = {}
                 for scene in scenes:
-                    ref = ref_by_id.get(scene.image_id)
+                    ref = ref_lookup(scene)
                     if ref is None:
                         continue
                     group = sensor_group(scene.sensor)
