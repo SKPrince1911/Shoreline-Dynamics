@@ -3184,17 +3184,14 @@ def _labels_all_interface(scene: Scene) -> np.ndarray:
     return labels
 
 
-def _reference_lookup(reference_shorelines: "gpd.GeoDataFrame"):
-    """Build a ``scene -> reference geometry`` matcher for the benchmark.
-
-    Primary: match on ``(src_year, src_sensor)`` — the scene's dry-year
-    (:func:`assign_dry_year`) and sensor — unioning all reference lines that carry
-    the same key (a shoreline digitised as several segments). Fallback (when the
-    layer lacks those columns): match ``scene.image_id`` against an ``image_id``
-    column. Returns a function; missing matches return ``None``.
-    """
-    def _grouped(keyfn):
+def _reference_index(reference_shorelines: "gpd.GeoDataFrame"):
+    """``(by_key, by_id)``: references grouped by ``(src_year, src_sensor)`` and by
+    ``image_id`` (each value the union of that key's lines, so multi-segment
+    references are handled)."""
+    def _grouped(cols, keyfn):
         out: Dict[object, list] = {}
+        if not all(c in reference_shorelines.columns for c in cols):
+            return out
         for _, r in reference_shorelines.iterrows():
             geom = r.geometry
             if geom is None or geom.is_empty:
@@ -3206,20 +3203,100 @@ def _reference_lookup(reference_shorelines: "gpd.GeoDataFrame"):
             out.setdefault(key, []).append(geom)
         return {k: unary_union(v) for k, v in out.items()}
 
-    if _has_src_cols(reference_shorelines):
-        by_key = _grouped(lambda r: (int(r["src_year"]), str(r["src_sensor"])))
+    by_key = _grouped(("src_year", "src_sensor"),
+                      lambda r: (int(r["src_year"]), str(r["src_sensor"])))
+    by_id = _grouped(("image_id",), lambda r: str(r["image_id"]))
+    return by_key, by_id
 
-        def lookup(scene: Scene):
-            dy = assign_dry_year(pd.Timestamp(scene.acq_datetime_utc))
-            return by_key.get((dy, str(scene.sensor)))
-        return lookup
 
-    by_id = _grouped(lambda r: str(r["image_id"])) \
-        if "image_id" in reference_shorelines.columns else {}
+def _lookup_reference(by_key, by_id, dry_year, sensor, image_id=None):
+    """Reference geometry for a ``(dry_year, sensor)`` key, else ``image_id``, else None."""
+    if by_key and dry_year is not None and sensor is not None:
+        g = by_key.get((int(dry_year), str(sensor)))
+        if g is not None:
+            return g
+    if by_id and image_id is not None:
+        return by_id.get(str(image_id))
+    return None
+
+
+def _reference_lookup(reference_shorelines: "gpd.GeoDataFrame"):
+    """A ``scene -> reference geometry`` matcher (``(src_year, src_sensor)`` primary,
+    ``image_id`` fallback) for :func:`benchmark_extraction`."""
+    by_key, by_id = _reference_index(reference_shorelines)
 
     def lookup(scene: Scene):
-        return by_id.get(str(scene.image_id))
+        dy = assign_dry_year(pd.Timestamp(scene.acq_datetime_utc))
+        return _lookup_reference(by_key, by_id, dy, scene.sensor, scene.image_id)
     return lookup
+
+
+def score_external_shorelines(
+    ext_gdf: "gpd.GeoDataFrame",
+    references: "gpd.GeoDataFrame",
+    transects: Optional["gpd.GeoDataFrame"] = None,
+    date_col: str = "acq_date",
+    sensor_col: str = "sensor",
+    image_id_col: str = "image_id",
+) -> pd.DataFrame:
+    """Score an EXTERNAL shoreline set (e.g. CoastSat) with the benchmark's metric.
+
+    Uses the IDENTICAL transect-offset metric as :func:`benchmark_extraction` —
+    the same :func:`_transect_offsets` (same per-transect land->sea crossing and the
+    same >1-crossing exclusion), the same reprojection to EPSG:32646, and the same
+    aggregation — so an external method's ``rmse_m``/``bias_m``/``mae_m``/``n``/
+    ``n_multi_excluded`` are directly comparable to ours (config A vs B/C).
+
+    Each external feature (EPSG:4326 geometry) is matched to a reference by
+    ``(dry_year = assign_dry_year(date), sensor)`` — the same key the benchmark uses
+    to match references to scenes — with an ``image_id`` fallback. ``date_col`` /
+    ``sensor_col`` / ``image_id_col`` name those fields on ``ext_gdf`` (missing
+    columns are simply not used for matching).
+
+    Returns:
+        One row per ``sensor_group`` with ``method='external'`` and
+        ``rmse_m``/``bias_m``/``mae_m``/``n``/``n_multi_excluded``.
+    """
+    if transects is None:
+        transects = load_transects()
+    by_key, by_id = _reference_index(references)
+    has_date = date_col in ext_gdf.columns
+    has_sensor = sensor_col in ext_gdf.columns
+    has_id = image_id_col in ext_gdf.columns
+    acc: Dict[str, Dict[str, object]] = {}
+    for _, r in ext_gdf.iterrows():
+        geom = r.geometry
+        if geom is None or geom.is_empty:
+            continue
+        sensor = str(r[sensor_col]) if has_sensor else None
+        dry_year = (assign_dry_year(pd.Timestamp(r[date_col]))
+                    if has_date and pd.notna(r[date_col]) else None)
+        image_id = str(r[image_id_col]) if has_id else None
+        ref = _lookup_reference(by_key, by_id, dry_year, sensor, image_id)
+        if ref is None:
+            continue
+        group = sensor_group(sensor) if sensor else "external"
+        # IDENTICAL metric to benchmark_extraction: external line -> EPSG:32646,
+        # reference -> EPSG:32646, offsets along the SAME transects.
+        off, multi = _transect_offsets(_to_utm(geom), _to_utm(ref), transects)
+        bucket = acc.setdefault(group, {"off": [], "n_multi": 0})
+        bucket["off"].extend(off[np.isfinite(off)].tolist())
+        bucket["n_multi"] = int(bucket["n_multi"]) + int(multi.sum())
+    rows: List[dict] = []
+    for group, bucket in acc.items():
+        arr = np.asarray(bucket["off"], dtype=float)
+        if arr.size == 0:
+            continue
+        rows.append({
+            "sensor_group": group,
+            "method": "external",
+            "rmse_m": float(np.sqrt(np.mean(arr ** 2))),
+            "bias_m": float(np.mean(arr)),
+            "mae_m": float(np.mean(np.abs(arr))),
+            "n": int(arr.size),
+            "n_multi_excluded": int(bucket["n_multi"]),
+        })
+    return pd.DataFrame(rows)
 
 
 def benchmark_extraction(
@@ -3284,7 +3361,10 @@ def benchmark_extraction(
                         # axis the caller can add later.
                         line = filter_contours(contours, search_zone, channel_lines,
                                                mode="raw")
-                        line_utm = _to_utm(line) if line is not None else None
+                        # filter_contours already returns EPSG:32646 (the contour
+                        # grid is metric) — use it as-is; the reference layer is
+                        # EPSG:4326, so only IT is reprojected to metric.
+                        line_utm = line
                     except Exception:
                         continue
                     off, multi = _transect_offsets(line_utm, _to_utm(ref), transects)
