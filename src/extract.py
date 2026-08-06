@@ -2799,6 +2799,66 @@ def persist_shoreline_outputs(
     return {"written": written, "push": status}
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint geometry stamp — invalidate a checkpoint when the geometry it was
+# built against (transects/baseline, or the shoreline mode) has changed, so a
+# baseline edit forces a fresh batch while a true disconnect still resumes.
+# ---------------------------------------------------------------------------
+def _sha_file(path: Optional[str]) -> Optional[str]:
+    """SHA-1 of a file's bytes, or ``None`` if missing."""
+    if not path or not os.path.exists(path):
+        return None
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _geometry_stamp(settings: dict) -> Dict[str, Optional[str]]:
+    """Fingerprint of the geometry a checkpoint depends on.
+
+    Content hashes of the resolved ``transects.geojson`` and ``data/baseline.geojson``
+    plus the shoreline ``mode`` — so an edited baseline (→ rebuilt transects) or a
+    ``raw``↔``envelope`` flip changes the stamp and invalidates a prior checkpoint.
+    Hashes (not mtime) so a fresh clone with reset mtimes still matches when the
+    geometry is genuinely unchanged.
+    """
+    return {
+        "transects_sha": _sha_file(_cache_read_path("transects.geojson")),
+        "baseline_sha": _sha_file(BASELINE_PATH),
+        "mode": str(settings.get("mode") or config.SHORELINE_MODE),
+    }
+
+
+def _stamp_path(checkpoint_path: str) -> str:
+    return checkpoint_path + ".stamp.json"
+
+
+def _write_stamps(paths: List[str], stamp: Dict[str, Optional[str]]) -> None:
+    """Write the geometry stamp sidecar next to each checkpoint path."""
+    import json as _json
+    for p in paths:
+        try:
+            with open(_stamp_path(p), "w", encoding="utf-8") as fh:
+                _json.dump(stamp, fh)
+        except OSError:
+            pass
+
+
+def _read_stamp(checkpoint_path: str) -> Optional[dict]:
+    import json as _json
+    sp = _stamp_path(checkpoint_path)
+    if not os.path.exists(sp):
+        return None
+    try:
+        with open(sp, encoding="utf-8") as fh:
+            return _json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
 def extract_all(
     scene_list: pd.DataFrame,
     settings: dict,
@@ -2806,6 +2866,7 @@ def extract_all(
     checkpoint_path: Optional[str] = None,
     log_path: str = EXTRACTION_LOG_PATH,
     resume: bool = True,
+    force_reextract: bool = False,
     tile_px: int = DEFAULT_TILE_PX,
     verbose: bool = True,
 ) -> "gpd.GeoDataFrame":
@@ -2827,7 +2888,11 @@ def extract_all(
             omitted.
         checkpoint_path: Override the checkpoint file (default: local + Drive
             ``sds_scenes.geojson``). log_path: extraction log.
-        resume: Skip scenes already present in the checkpoint.
+        resume: Resume from an existing checkpoint — but ONLY when its geometry
+            stamp (transects/baseline hash + mode) matches the current one; a
+            changed baseline/transects invalidates the checkpoint and forces a full
+            re-extraction (so an old result is never reused against new geometry).
+        force_reextract: Ignore any checkpoint and re-extract every scene.
 
     Returns:
         A ``GeoDataFrame`` (EPSG:4326) of all extracted shorelines.
@@ -2844,23 +2909,44 @@ def extract_all(
     if verbose:
         print("checkpoint ->", ", ".join(checkpoint_paths), flush=True)
     version = settings.get("classifier_version", DEFAULT_CLASSIFIER_VERSION)
+    n_total = len(scene_list)
 
     records: List[dict] = []
     done: set = set()
-    # Resume from the durable (Drive) copy first, else the local one.
+    # Resume from the durable (Drive) copy first, else the local one — but only
+    # when the checkpoint was built against the SAME geometry (transects/baseline/
+    # mode). A stamp mismatch means the baseline/transects changed since, so the
+    # cached per-scene results are stale and must be re-extracted from scratch.
+    stamp = _geometry_stamp(settings)
     resume_path = next((p for p in reversed(checkpoint_paths) if os.path.exists(p)), None)
-    if resume and resume_path:
-        prev = gpd.read_file(resume_path)
-        for _, r in prev.iterrows():
-            rec = r.drop(labels="geometry").to_dict()
-            rec["geometry"] = r.geometry
-            records.append(rec)
-            done.add(rec.get("image_id"))
+    if force_reextract:
         if verbose:
-            print(f"resuming: {len(done)} scenes already done <- {resume_path}", flush=True)
+            print(f"FORCE_REEXTRACT -> full re-extraction of all {n_total} scenes",
+                  flush=True)
+    elif resume and resume_path:
+        prev_stamp = _read_stamp(resume_path)
+        if prev_stamp == stamp:
+            prev = gpd.read_file(resume_path)
+            for _, r in prev.iterrows():
+                rec = r.drop(labels="geometry").to_dict()
+                rec["geometry"] = r.geometry
+                records.append(rec)
+                done.add(rec.get("image_id"))
+            if verbose:
+                print(f"resuming from checkpoint (geometry unchanged, {len(done)} "
+                      f"scenes done) <- {resume_path}", flush=True)
+        elif verbose:
+            reason = ("no geometry stamp on the old checkpoint"
+                      if prev_stamp is None else
+                      "transects/baseline changed since last checkpoint")
+            print(f"{reason} -> re-extracting all {n_total} scenes from scratch",
+                  flush=True)
+    elif verbose:
+        print(f"no checkpoint -> extracting all {n_total} scenes", flush=True)
+    # Record the geometry this run's checkpoint is built against (for next time).
+    _write_stamps(checkpoint_paths, stamp)
 
     clf_cache: Dict[str, Pipeline] = dict(classifiers or {})
-    n_total = len(scene_list)
     for i, (_, row) in enumerate(scene_list.iterrows(), start=1):
         image_id = str(row["image_id"])
         if image_id in done:
