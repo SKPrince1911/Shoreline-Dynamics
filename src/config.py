@@ -289,6 +289,16 @@ MAX_INTERIOR_LOOP_AREA_M2: float = 50000.0  # <-- TUNABLE (5 ha)
 # fixed compass assumption.  <-- TUNABLE  (lon, lat)
 SEAWARD_REFERENCE_LONLAT: tuple = (91.7, 21.1)
 
+# Seaward-envelope gap bridging (envelope mode). Walking transects alongshore, a
+# short run of transects that contribute no seaward point (a ragged patch, a lone
+# cloud pixel) should NOT fragment the shoreline: runs of at most
+# ENVELOPE_MAX_BRIDGE_GAP consecutive non-contributing transects are bridged (the
+# line stays one part), provided the two bracketing seaward points are no farther
+# apart than ENVELOPE_MAX_BRIDGE_DIST metres. A longer run, or a wider jump (a true
+# discontinuity such as a river mouth), still starts a new part.  <-- TUNABLE
+ENVELOPE_MAX_BRIDGE_GAP: int = 2        # <-- TUNABLE (consecutive empty transects)
+ENVELOPE_MAX_BRIDGE_DIST: float = 300.0  # <-- TUNABLE (metres between bracketing points)
+
 # A dry-season composite whose contributing acquisitions span more than this many
 # days mixes shoreline positions from different parts of the season (e.g. 1995 =
 # 1994-11-20 + 1995-03-19, 119 days apart). Per-scene extraction (D1) fixes the

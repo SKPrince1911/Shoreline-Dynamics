@@ -336,7 +336,8 @@ OUTPUT_SCHEMA: List[str] = [
     "aoi_coverage_pct", "slc_off", "composite_date_spread_days", "season_complete",
     "water_index", "threshold_method", "threshold_value", "classifier_version",
     "length_m", "n_vertices", "pct_aoi_alongshore_covered",
-    "envelope_n_multi", "envelope_skipped_nodata", "seaward_methods", "flags",
+    "contour_n_parts", "envelope_n_parts", "envelope_n_multi",
+    "envelope_skipped_nodata", "envelope_n_bridged_gaps", "seaward_methods", "flags",
 ]
 
 # Reusable CRS transformers (EPSG:4326 <-> EPSG:32646, always lon/lat order).
@@ -1778,6 +1779,13 @@ def _weighted_peaks_threshold(values: np.ndarray) -> float:
 # the beach back-edge, exactly the boundary we are trying to exclude.  <-- TUNABLE
 INTERFACE_DILATE_PX: int = 0
 
+# A contour vertex is dropped (splitting the polyline) only where it lands OUTSIDE
+# the interface mask. A single ragged out-of-mask pixel under the waterline should
+# not fragment an otherwise continuous contour, so out-of-mask runs no longer than
+# this many pixels are bridged; only genuine multi-pixel gaps (interior holes /
+# no-data) break the line.  <-- TUNABLE
+CONTOUR_BRIDGE_TOL_PX: int = 1
+
 
 def interface_mask(labels: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """The sand↔water interface region — where a shoreline contour may be traced.
@@ -1815,9 +1823,23 @@ def extract_contour(
     row/col) precision; these are mapped to EPSG:32646 pixel *centres* via the
     affine transform. ``mask`` is the region the contour may be traced in — pass
     :func:`interface_mask` (sand∪water∪whitewater ∩ valid) so only the sand↔water
-    boundary is contoured, NOT the sand↔vegetation edge. Contours are broken (not
-    bridged) across out-of-mask pixels: any vertex whose 3x3 neighbourhood touches
-    a masked pixel is dropped, splitting the polyline there.
+    boundary is contoured, NOT the sand↔vegetation edge.
+
+    Two subtleties keep one continuous waterline in one piece:
+
+    * **Nearest-neighbour fill.** Out-of-mask pixels inherit the index value of
+      their closest in-mask pixel, so the mask boundary carries no artificial index
+      step and marching-squares draws no spurious contour along it. In particular
+      the sand↔vegetation edge (a sand↔``other`` boundary) stays contour-free: the
+      ``other`` side is filled from the nearest sand pixel, the same side of the
+      threshold, so no crossing forms. The true waterline lies wholly inside the
+      mask (sand↔water) and is untouched. The old median fill instead injected a
+      constant that crossed the threshold against every boundary pixel, which
+      shredded the waterline into fragments.
+    * **Break only at genuine gaps.** A vertex is kept while it sits inside the
+      interface mask; the polyline is split only where a vertex lands on an
+      out-of-mask pixel (interior hole / no-data). A lone ragged out-of-mask pixel
+      (run ≤ ``CONTOUR_BRIDGE_TOL_PX``) is bridged so it does not fragment the line.
 
     Returns:
         A list of ``LineString`` geometries in EPSG:32646.
@@ -1826,9 +1848,12 @@ def extract_contour(
     good = np.isfinite(arr) & mask.astype(bool)
     if good.sum() < 2:
         return []
-    fill = float(np.median(arr[good]))
-    arr = np.where(good, arr, fill)
-    invalid_dil = morphology.binary_dilation(~good, np.ones((3, 3), bool))
+    # Fill every out-of-mask pixel from its nearest in-mask pixel (no index step at
+    # the mask boundary -> no spurious sand/vegetation contour).
+    idx = ndimage.distance_transform_edt(
+        ~good, return_distances=False, return_indices=True
+    )
+    arr = arr[tuple(idx)]
     height, width = arr.shape
 
     lines: List[LineString] = []
@@ -1837,7 +1862,9 @@ def extract_contour(
         cols = contour[:, 1]
         rr = np.clip(np.round(rows).astype(int), 0, height - 1)
         cc = np.clip(np.round(cols).astype(int), 0, width - 1)
-        ok = ~invalid_dil[rr, cc]
+        # Keep a vertex while its pixel is inside the interface mask; split only at
+        # genuine gaps, bridging lone ragged out-of-mask pixels.
+        ok = _bridge_short_false(good[rr, cc], tol=CONTOUR_BRIDGE_TOL_PX)
         for run in _true_runs(ok):
             if run.stop - run.start < 2:
                 continue
@@ -1848,6 +1875,30 @@ def extract_contour(
             if len(xy) >= 2:
                 lines.append(LineString(xy))
     return lines
+
+
+def _bridge_short_false(ok: np.ndarray, tol: int = 1) -> np.ndarray:
+    """Flip *interior* runs of ``False`` no longer than ``tol`` to ``True``.
+
+    A lone ragged out-of-mask pixel under a contour vertex should not split an
+    otherwise continuous waterline; only genuine multi-pixel gaps (interior holes /
+    no-data) break the line. Leading/trailing ``False`` runs are left as-is so the
+    line is trimmed to end on an in-mask vertex, not extended past the mask.
+    """
+    out = np.asarray(ok, dtype=bool).copy()
+    n = out.size
+    i = 0
+    while i < n:
+        if out[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not out[j]:
+            j += 1
+        if 0 < i and j < n and (j - i) <= tol:  # interior short gap -> bridge
+            out[i:j] = True
+        i = j
+    return out
 
 
 def _true_runs(mask: np.ndarray) -> List[slice]:
@@ -2028,7 +2079,8 @@ def filter_contours(
 
     ``watermask`` is the per-scene ``(labels, transform)`` used to resolve each
     transect's seaward direction (envelope only). ``audit`` — when a dict is passed
-    — is populated in envelope mode with ``envelope_n_multi`` and ``seaward_methods``
+    — is populated in envelope mode with ``envelope_n_multi``,
+    ``envelope_skipped_nodata``, ``envelope_n_bridged_gaps`` and ``seaward_methods``
     (the :func:`seaward_envelope` diagnostics) so the caller can record them.
 
     Returns:
@@ -2057,12 +2109,13 @@ def filter_contours(
     merged_geom = ordered[0] if len(ordered) == 1 else MultiLineString(ordered)
 
     if mode == "envelope" and transects is not None:
-        env, n_multi, skipped_nodata, methods = seaward_envelope(
+        env, n_multi, skipped_nodata, n_bridged_gaps, methods = seaward_envelope(
             merged_geom, transects, watermask=watermask
         )
         if audit is not None:
             audit["envelope_n_multi"] = n_multi
             audit["envelope_skipped_nodata"] = skipped_nodata
+            audit["envelope_n_bridged_gaps"] = n_bridged_gaps
             audit["seaward_methods"] = methods
         return env if env is not None else merged_geom
     return merged_geom  # raw (or envelope with no transects) — bit-for-bit
@@ -2334,18 +2387,25 @@ def seaward_envelope(
     **No-data (per-scene, stateless).** A crossing is only taken when it sits on
     VALID data with a valid neighbourhood either side (:func:`_crossing_on_valid`),
     so the edge of a no-data region (scene edge / SLC-off-style striping) is never
-    mistaken for a shoreline. The connecting line is BROKEN at any transect that
-    contributes no valid point (a ``MultiLineString``), so it never interpolates a
-    straight segment across a gap. The transect set is untouched — the same transect
+    mistaken for a shoreline. The transect set is untouched — the same transect
     contributes normally on scenes where it is valid.
 
+    **Gap bridging.** A single non-contributing transect (a ragged patch, a lone
+    rejected crossing) should not fragment the shoreline, so a run of at most
+    ``config.ENVELOPE_MAX_BRIDGE_GAP`` consecutive empty transects is bridged (the
+    line stays one part) as long as the two bracketing seaward points are within
+    ``config.ENVELOPE_MAX_BRIDGE_DIST`` metres. A longer run — or a wider jump, i.e.
+    a genuine discontinuity such as a river mouth — still BREAKS into a new part, so
+    the line is never interpolated straight across a real gap.
+
     Returns:
-        ``(geometry, n_multi, skipped_nodata, methods)`` — a ``LineString`` /
-        ``MultiLineString`` (or ``None`` if nothing survives), the count of transects
-        that crossed more than once (recurved spits / complex mouths),
-        ``skipped_nodata`` (transects dropped for this scene because their crossings
-        were no-data edges or they lie in a no-data gap), and a ``methods`` tally:
-        the resolution method per contributing transect
+        ``(geometry, n_multi, skipped_nodata, n_bridged_gaps, methods)`` — a
+        ``LineString`` / ``MultiLineString`` (or ``None`` if nothing survives), the
+        count of transects that crossed more than once (recurved spits / complex
+        mouths), ``skipped_nodata`` (transects dropped for this scene because their
+        crossings were no-data edges or they lie in a no-data gap), ``n_bridged_gaps``
+        (short empty runs stitched over rather than broken at), and a ``methods``
+        tally: the resolution method per contributing transect
         (``watermask``/``baseline_normal``/``land_is_east``) plus the fall-through
         reason breakdown (``fb_no_water``/``fb_no_sand``/``fb_tie``/``fb_no_labels``).
     """
@@ -2357,24 +2417,28 @@ def seaward_envelope(
     if config.DROP_INTERIOR_LOOPS:
         parts = _drop_small_loops(parts, drop_loop_area_m2)
     if not parts:
-        return None, 0, 0, methods
+        return None, 0, 0, 0, methods
     work = unary_union(parts)
 
     labels, transform, valid = _unpack_watermask(watermask)
     gate = valid is not None and transform is not None
     px = abs(transform.a) if transform is not None else 30.0
+    max_gap = int(getattr(config, "ENVELOPE_MAX_BRIDGE_GAP", 2))
+    max_dist = float(getattr(config, "ENVELOPE_MAX_BRIDGE_DIST", 300.0))
 
     tdf = transects.sort_values("transect_id") \
         if "transect_id" in transects.columns else transects
     segments: List[List[Point]] = []   # runs of consecutive contributing transects
     current: List[Point] = []
     prev_ord: Optional[int] = None
+    prev_pt: Optional[Point] = None
     n_multi = 0
     skipped_nodata = 0
+    n_bridged_gaps = 0
     for ord_i, (_, t) in enumerate(tdf.iterrows()):
         tr = t.geometry
         if tr is None or tr.is_empty:
-            continue  # missing transect -> breaks the run (ord gap below)
+            continue  # missing transect -> widens the ordinal gap handled below
         pts = _crossing_points(work, tr)
         # Keep only crossings on valid data (reject no-data-edge artefacts).
         good_pts = ([p for p in pts if _crossing_on_valid(p, tr, transform, valid, px)]
@@ -2384,15 +2448,26 @@ def seaward_envelope(
                 n_multi += 1
             _seaward_end, landward_end, method, reason = _resolve_seaward(tr, labels, transform)
             seaward_pt = max(good_pts, key=lambda p: p.distance(landward_end))
-            # Break the line where this transect is not alongshore-adjacent to the
-            # previous contributor (a skipped/no-data transect sits between them).
-            if prev_ord is not None and ord_i != prev_ord + 1 and len(current) >= 2:
-                segments.append(current)
-                current = []
-            elif prev_ord is not None and ord_i != prev_ord + 1:
-                current = []
+            if prev_ord is not None and ord_i != prev_ord + 1:
+                # A run of non-contributing transects sits between this point and the
+                # previous contributor. Bridge it (keep one part) when the run is
+                # short AND the two bracketing points are close; otherwise BREAK into
+                # a new part (a longer gap or a wide jump = a genuine discontinuity).
+                gap = ord_i - prev_ord - 1
+                bridgeable = (
+                    gap <= max_gap
+                    and prev_pt is not None
+                    and seaward_pt.distance(prev_pt) <= max_dist
+                )
+                if bridgeable:
+                    n_bridged_gaps += 1
+                else:
+                    if len(current) >= 2:
+                        segments.append(current)
+                    current = []
             current.append(seaward_pt)
             prev_ord = ord_i
+            prev_pt = seaward_pt
             methods[method] += 1
             if reason:
                 methods[f"fb_{reason}"] = methods.get(f"fb_{reason}", 0) + 1
@@ -2405,10 +2480,10 @@ def seaward_envelope(
         segments.append(current)
 
     if not segments:
-        return None, n_multi, skipped_nodata, methods
+        return None, n_multi, skipped_nodata, n_bridged_gaps, methods
     lines = [LineString([(p.x, p.y) for p in seg]) for seg in segments]
     geom = lines[0] if len(lines) == 1 else MultiLineString(lines)
-    return geom, n_multi, skipped_nodata, methods
+    return geom, n_multi, skipped_nodata, n_bridged_gaps, methods
 
 
 def seaward_debug(
@@ -2595,7 +2670,7 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
     iface = interface_mask(labels, scene.valid)
     contours = extract_contour(index, threshold, iface, scene.transform)
     del index, iface  # index/iface are only needed through the contour step
-    audit: Dict[str, object] = {}
+    audit: Dict[str, object] = {"contour_n_parts": len(contours)}
     line_utm = filter_contours(
         contours, settings.get("search_zone"), settings.get("channel_lines", []),
         settings.get("min_length_m", config.MIN_SHORELINE_LENGTH_M),
@@ -2647,8 +2722,11 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         "length_m": length_m,
         "n_vertices": n_vertices,
         "pct_aoi_alongshore_covered": min(100.0, 100.0 * length_m / AOI_ALONGSHORE_M),
+        "contour_n_parts": int(audit.get("contour_n_parts", 0)),
+        "envelope_n_parts": _count_parts(line_utm),
         "envelope_n_multi": int(audit.get("envelope_n_multi", 0)),
         "envelope_skipped_nodata": int(audit.get("envelope_skipped_nodata", 0)),
+        "envelope_n_bridged_gaps": int(audit.get("envelope_n_bridged_gaps", 0)),
         "seaward_methods": _fmt_methods(audit.get("seaward_methods")),
         "flags": ",".join(flags),
         "geometry": geom_wgs,
@@ -2660,6 +2738,13 @@ def _count_vertices(geom) -> int:
     if geom is None:
         return 0
     return sum(len(ln.coords) for ln in _as_line_list(geom))
+
+
+def _count_parts(geom) -> int:
+    """Number of ``LineString`` parts in a (Multi)LineString (0 for ``None``)."""
+    if geom is None:
+        return 0
+    return len(_as_line_list(geom))
 
 
 def _fmt_methods(methods: Optional[dict]) -> str:
