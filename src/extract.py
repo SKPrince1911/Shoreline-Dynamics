@@ -141,6 +141,9 @@ DRIVE_CACHE_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/cache"
 # the batch runs so a mid-run disconnect on the long Series B run is recoverable and
 # resumable, and pushed to GitHub. Falls back to the local repo ``outputs/shorelines``.
 DRIVE_SHORELINES_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/shorelines"
+# The benchmark comparison tables (paper data) are likewise mirrored to Drive as a
+# durable artifact and pushed to GitHub, independent of any config change.
+DRIVE_BENCHMARK_DIR: str = "/content/drive/MyDrive/shoreline_dynamics/benchmark"
 REPO_SLUG: str = "SKPrince1911/Shoreline-Dynamics"  # <-- TUNABLE (owner/repo for the GitHub push)
 
 # Streamed training fetches each source scene over just the bbox of ITS OWN
@@ -316,6 +319,7 @@ def get_scene_list_dense(force_rebuild: bool = False, **kwargs) -> pd.DataFrame:
 
 # Output locations (D-locked schema, PHASE2_SPEC.md §3).
 SHORELINE_DIR: str = os.path.join(config.OUTPUT_DIR, "shorelines")
+BENCHMARK_DIR: str = os.path.join(config.OUTPUT_DIR, "benchmark")
 SDS_SCENES_PATH: str = os.path.join(SHORELINE_DIR, "sds_scenes.geojson")
 SDS_ANNUAL_PATH: str = os.path.join(SHORELINE_DIR, "sds_annual_merged.geojson")
 EXTRACTION_LOG_PATH: str = os.path.join(config.OUTPUT_DIR, "extraction_log.csv")
@@ -2610,6 +2614,7 @@ def default_settings(
     classifier_version: str = DEFAULT_CLASSIFIER_VERSION,
     min_length_m: float = config.MIN_SHORELINE_LENGTH_M,
     mode: Optional[str] = None,
+    threshold_method_by_group: Optional[Dict[str, str]] = None,
 ) -> dict:
     """Assemble an extraction ``settings`` dict (loads search zone + closures +
     transects once).
@@ -2619,15 +2624,28 @@ def default_settings(
     DSAS transects are loaded (built from ``data/baseline.geojson`` if needed); if
     no baseline exists yet, ``transects`` is ``None``, a one-line note is printed,
     and extraction falls back to raw.
+
+    ``threshold_method_by_group`` is the LOCKED operational per-sensor-group
+    threshold map (defaults to ``config.THRESHOLD_METHOD_BY_GROUP``:
+    MSI/OLI ``otsu``, TM ``weighted_peaks`` — the benchmark's local-classifier
+    winners). :func:`extract_shoreline` uses the entry for the scene's group and
+    falls back to the scalar ``threshold_method`` for any group not in the map. The
+    benchmark (:func:`benchmark_extraction`) ignores this and still sweeps every
+    ``{index x method}`` combination.
     """
     mode = mode or config.SHORELINE_MODE
     transects = _load_or_build_transects()
     if mode == "envelope" and transects is None:
         print("shoreline mode 'envelope' requested but no transects yet "
               "(digitise data/baseline.geojson) -> falling back to 'raw'.")
+    if threshold_method_by_group is None:
+        threshold_method_by_group = dict(
+            getattr(config, "THRESHOLD_METHOD_BY_GROUP", {})
+        )
     return {
         "water_index": water_index_name,
         "threshold_method": threshold_method,
+        "threshold_method_by_group": threshold_method_by_group,
         "classifier_version": classifier_version,
         "min_length_m": min_length_m,
         "search_zone": load_search_zone(),
@@ -2664,7 +2682,14 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
     """
     labels = classify_scene(scene, clf)
     index = water_index(scene, settings["water_index"])
-    threshold = interface_threshold(index, labels, settings["threshold_method"])
+    # LOCKED operational threshold method per sensor group (benchmark winners:
+    # MSI/OLI otsu, TM weighted_peaks); fall back to the scalar method for any
+    # group not in the map. The benchmark itself still sweeps every method.
+    group = sensor_group(scene.sensor)
+    method = settings.get("threshold_method_by_group", {}).get(
+        group, settings["threshold_method"]
+    )
+    threshold = interface_threshold(index, labels, method)
     # Trace the contour ONLY across the sand↔water interface (not the whole valid
     # scene) so the landward sand↔vegetation edge cannot produce a shoreline.
     iface = interface_mask(labels, scene.valid)
@@ -2716,7 +2741,7 @@ def extract_shoreline(scene: Scene, clf: Pipeline, settings: dict) -> dict:
         "composite_date_spread_days": spread_days,
         "season_complete": bool(getattr(scene, "_season_complete", True)),
         "water_index": settings["water_index"],
-        "threshold_method": settings["threshold_method"],
+        "threshold_method": method,   # the ACTUAL per-group method used this scene
         "threshold_value": float(threshold),
         "classifier_version": settings["classifier_version"],
         "length_m": length_m,
@@ -2879,6 +2904,75 @@ def persist_shoreline_outputs(
     if push:
         if message is None:
             message = f"Update shoreline outputs @ {datetime.now(timezone.utc).isoformat()}"
+        status = push_outputs_to_github(message)
+        print("GitHub push:", status, flush=True)
+    return {"written": written, "push": status}
+
+
+def _benchmark_out_paths(filename: str) -> List[str]:
+    """Destinations for a benchmark table: local ``outputs/benchmark`` (for the
+    GitHub push) plus the Drive mirror when mounted (durable paper artifact)."""
+    paths = [os.path.join(BENCHMARK_DIR, filename)]
+    if os.path.isdir(DRIVE_MOUNT):
+        paths.append(os.path.join(DRIVE_BENCHMARK_DIR, filename))
+    return paths
+
+
+def best_config_per_group(grid_df: "pd.DataFrame") -> "pd.DataFrame":
+    """Best (min-``rmse_m``) benchmark row per ``sensor_group``.
+
+    Prefers the ``classifier == 'local'`` rows (our operational arm); if the grid
+    has no ``classifier`` column or no local rows, ranks over all rows. Read-only —
+    the benchmark grid itself is never modified or filtered in place.
+    """
+    df = grid_df
+    if "classifier" in df.columns:
+        local = df[df["classifier"] == "local"]
+        if len(local):
+            df = local
+    if not len(df) or "sensor_group" not in df.columns or "rmse_m" not in df.columns:
+        return df.iloc[0:0]
+    return df.loc[df.groupby("sensor_group")["rmse_m"].idxmin()].reset_index(drop=True)
+
+
+def persist_benchmark_outputs(
+    grid_df: "pd.DataFrame",
+    best_df: Optional["pd.DataFrame"] = None,
+    intersensor_df: Optional["pd.DataFrame"] = None,
+    push: bool = True,
+    message: Optional[str] = None,
+) -> Dict[str, object]:
+    """Persist the benchmark comparison tables (paper data) as a durable artifact.
+
+    Writes the FULL :func:`benchmark_extraction` grid to
+    ``outputs/benchmark/benchmark_grid.csv`` (every row: ``sensor_group``,
+    ``water_index``, ``threshold_method``, ``classifier``, ``rmse_m``, ``bias_m``,
+    ``mae_m``, ``n``, ``n_multi_excluded``), the best-config-per-sensor summary to
+    ``benchmark_best.csv`` (derived via :func:`best_config_per_group` when
+    ``best_df`` is omitted), and the inter-sensor bias table to
+    ``intersensor_bias.csv`` when given — each to the local repo ``outputs/benchmark``
+    (for the GitHub push) AND the Drive mirror (survives a restart). When ``push``
+    and a ``GITHUB_TOKEN`` secret is present, commits + pushes ``outputs/`` to
+    ``main``. This artifact is independent of any config change. Returns
+    ``{"written": [...], "push": status}``.
+    """
+    if best_df is None:
+        best_df = best_config_per_group(grid_df)
+    written: List[str] = []
+    for df, name in ((grid_df, "benchmark_grid.csv"),
+                     (best_df, "benchmark_best.csv"),
+                     (intersensor_df, "intersensor_bias.csv")):
+        if df is None or len(df) == 0:
+            continue
+        for path in _benchmark_out_paths(name):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            df.to_csv(path, index=False)
+            print("wrote", path, flush=True)
+            written.append(path)
+    status = None
+    if push:
+        if message is None:
+            message = f"Benchmark comparison results @ {datetime.now(timezone.utc).isoformat()}"
         status = push_outputs_to_github(message)
         print("GitHub push:", status, flush=True)
     return {"written": written, "push": status}

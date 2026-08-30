@@ -255,6 +255,14 @@ WATER_INDICES: List[str] = ["mndwi", "ndwi", "aweinsh", "scowi"]
 WATER_INDEX_DEFAULT: str = "mndwi"
 THRESHOLD_METHODS: List[str] = ["otsu", "weighted_peaks"]
 THRESHOLD_METHOD_DEFAULT: str = "otsu"
+# Operational (production-extraction) threshold method PER sensor group, LOCKED
+# from the benchmark's local-classifier winners (min transect-normal RMSE):
+# MSI mndwi+otsu, OLI mndwi+otsu, TM mndwi+weighted_peaks. This is the operational
+# config only — benchmark_extraction still sweeps ALL {index x method} combinations.
+# A group not listed here falls back to THRESHOLD_METHOD_DEFAULT.  <-- TUNABLE
+THRESHOLD_METHOD_BY_GROUP: Dict[str, str] = {
+    "MSI": "otsu", "OLI": "otsu", "TM": "weighted_peaks",
+}
 
 # Contour filtering: minimum length of a MERGED shoreline segment (applied AFTER
 # linemerge, so fragmented contours from cloud edges or L7 SLC-off striping are
