@@ -264,6 +264,25 @@ THRESHOLD_METHOD_BY_GROUP: Dict[str, str] = {
     "MSI": "otsu", "OLI": "otsu", "TM": "weighted_peaks",
 }
 
+# Contour fragmentation control (STEP 2). The per-pixel interface mask
+# (sand∪water∪whitewater ∩ valid) is ragged along the waterline: isolated 'other'/
+# no-data/misclassified speckles and patchy whitewater punch small holes that split
+# the marching-squares contour into hundreds of fragments. These three tunables
+# reduce that over-splitting WITHOUT moving the shoreline or reconnecting genuine
+# gaps:
+# - INTERFACE_CLOSE_PX: morphologically CLOSE the mask (binary_closing +
+#   remove_small_holes) to fill pinhole holes / speckles up to this radius (px)
+#   before deciding where the contour may run. Small on purpose — it must NOT bridge
+#   a real vegetation strip between sand patches or fill a wide no-data stripe.
+# - CONTOUR_BRIDGE_TOL_PX: keep (don't split at) runs of up to this many consecutive
+#   out-of-mask contour vertices; longer runs (genuine gaps) still split.
+# - CONTOUR_MERGE_GAP_M: after contouring, stitch two LineStrings whose near
+#   endpoints are within this distance (m) AND nearly colinear at the join; 0
+#   disables. Never bridges a larger separation.
+INTERFACE_CLOSE_PX: int = 2       # <-- TUNABLE (px; 0 = no closing)
+CONTOUR_BRIDGE_TOL_PX: int = 3    # <-- TUNABLE (max out-of-mask vertex run bridged)
+CONTOUR_MERGE_GAP_M: float = 30.0  # <-- TUNABLE (m; 0 = no post-contour stitch)
+
 # Contour filtering: minimum length of a MERGED shoreline segment (applied AFTER
 # linemerge, so fragmented contours from cloud edges or L7 SLC-off striping are
 # stitched before this floor is applied). This coast is cut by 13 tidal channels,

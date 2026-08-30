@@ -63,6 +63,7 @@ from rasterio.io import MemoryFile
 from rasterio.transform import Affine, xy as raster_xy
 from skimage import filters, measure, morphology
 from scipy import ndimage, signal
+from scipy.spatial import cKDTree
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -1783,12 +1784,14 @@ def _weighted_peaks_threshold(values: np.ndarray) -> float:
 # the beach back-edge, exactly the boundary we are trying to exclude.  <-- TUNABLE
 INTERFACE_DILATE_PX: int = 0
 
-# A contour vertex is dropped (splitting the polyline) only where it lands OUTSIDE
-# the interface mask. A single ragged out-of-mask pixel under the waterline should
-# not fragment an otherwise continuous contour, so out-of-mask runs no longer than
-# this many pixels are bridged; only genuine multi-pixel gaps (interior holes /
-# no-data) break the line.  <-- TUNABLE
-CONTOUR_BRIDGE_TOL_PX: int = 1
+# Contour fragmentation control (STEP 2). Defaults come from ``config`` at call
+# time (reload-safe); these module fallbacks apply only if config lacks them. A
+# contour vertex is dropped (splitting the polyline) only where it lands OUTSIDE the
+# CLOSED interface mask, and out-of-mask vertex runs no longer than the bridge
+# tolerance are kept anyway — only genuine multi-pixel gaps break the line.  <-- TUNABLE
+CONTOUR_BRIDGE_TOL_PX: int = 3   # fallback for config.CONTOUR_BRIDGE_TOL_PX
+INTERFACE_CLOSE_PX: int = 2      # fallback for config.INTERFACE_CLOSE_PX
+CONTOUR_MERGE_GAP_M: float = 30.0  # fallback for config.CONTOUR_MERGE_GAP_M
 
 
 def interface_mask(labels: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -1829,21 +1832,29 @@ def extract_contour(
     :func:`interface_mask` (sand∪water∪whitewater ∩ valid) so only the sand↔water
     boundary is contoured, NOT the sand↔vegetation edge.
 
-    Two subtleties keep one continuous waterline in one piece:
+    Three things keep one continuous waterline in one piece without moving it:
 
     * **Nearest-neighbour fill.** Out-of-mask pixels inherit the index value of
       their closest in-mask pixel, so the mask boundary carries no artificial index
       step and marching-squares draws no spurious contour along it. In particular
       the sand↔vegetation edge (a sand↔``other`` boundary) stays contour-free: the
       ``other`` side is filled from the nearest sand pixel, the same side of the
-      threshold, so no crossing forms. The true waterline lies wholly inside the
-      mask (sand↔water) and is untouched. The old median fill instead injected a
-      constant that crossed the threshold against every boundary pixel, which
-      shredded the waterline into fragments.
+      threshold, so no crossing forms. The fill uses the ORIGINAL interface mask, so
+      the vertex positions marching-squares returns are unchanged by the two steps
+      below — only which vertices are kept/split changes.
+    * **Closed split-mask (STEP 2).** The real per-pixel mask is peppered with tiny
+      holes along the waterline (isolated ``other``/no-data/misclassified speckles,
+      patchy whitewater). Deciding the split on the raw mask shreds the contour into
+      hundreds of fragments. So the split uses a morphologically CLOSED copy of the
+      mask (:func:`_close_interface_mask`, radius ``config.INTERFACE_CLOSE_PX``) that
+      fills those pinholes without moving the outer land/water boundary. A wide
+      no-data stripe or a real vegetation strip stays open, so genuine gaps still
+      split.
     * **Break only at genuine gaps.** A vertex is kept while it sits inside the
-      interface mask; the polyline is split only where a vertex lands on an
-      out-of-mask pixel (interior hole / no-data). A lone ragged out-of-mask pixel
-      (run ≤ ``CONTOUR_BRIDGE_TOL_PX``) is bridged so it does not fragment the line.
+      CLOSED mask; runs of up to ``config.CONTOUR_BRIDGE_TOL_PX`` consecutive
+      out-of-mask vertices are bridged, longer runs split. Finally near-colinear
+      pieces split by a gap ≤ ``config.CONTOUR_MERGE_GAP_M`` are stitched
+      (:func:`_merge_near_colinear`) — never across a wider separation.
 
     Returns:
         A list of ``LineString`` geometries in EPSG:32646.
@@ -1853,12 +1864,19 @@ def extract_contour(
     if good.sum() < 2:
         return []
     # Fill every out-of-mask pixel from its nearest in-mask pixel (no index step at
-    # the mask boundary -> no spurious sand/vegetation contour).
+    # the mask boundary -> no spurious sand/vegetation contour). Uses the ORIGINAL
+    # mask so marching-squares vertex POSITIONS are identical to before STEP 2.
     idx = ndimage.distance_transform_edt(
         ~good, return_distances=False, return_indices=True
     )
     arr = arr[tuple(idx)]
     height, width = arr.shape
+
+    # Split decision uses a CLOSED mask: fill pinhole holes / speckles along the
+    # waterline so they don't fragment the contour; wide gaps stay open.
+    close_px = int(getattr(config, "INTERFACE_CLOSE_PX", INTERFACE_CLOSE_PX))
+    good_split = _close_interface_mask(good, close_px) if close_px > 0 else good
+    tol = int(getattr(config, "CONTOUR_BRIDGE_TOL_PX", CONTOUR_BRIDGE_TOL_PX))
 
     lines: List[LineString] = []
     for contour in measure.find_contours(arr, level=float(threshold)):
@@ -1866,9 +1884,9 @@ def extract_contour(
         cols = contour[:, 1]
         rr = np.clip(np.round(rows).astype(int), 0, height - 1)
         cc = np.clip(np.round(cols).astype(int), 0, width - 1)
-        # Keep a vertex while its pixel is inside the interface mask; split only at
-        # genuine gaps, bridging lone ragged out-of-mask pixels.
-        ok = _bridge_short_false(good[rr, cc], tol=CONTOUR_BRIDGE_TOL_PX)
+        # Keep a vertex while its pixel is inside the closed interface mask; split
+        # only at genuine gaps, bridging short out-of-mask runs.
+        ok = _bridge_short_false(good_split[rr, cc], tol=tol)
         for run in _true_runs(ok):
             if run.stop - run.start < 2:
                 continue
@@ -1878,7 +1896,110 @@ def extract_contour(
             xy = list(zip(np.atleast_1d(xs), np.atleast_1d(ys)))
             if len(xy) >= 2:
                 lines.append(LineString(xy))
+
+    # Stitch pieces split by a tiny colinear gap (positions of existing vertices are
+    # untouched — only a short bridging segment is added).
+    merge_gap = float(getattr(config, "CONTOUR_MERGE_GAP_M", CONTOUR_MERGE_GAP_M))
+    if merge_gap > 0 and len(lines) > 1:
+        lines = _merge_near_colinear(lines, merge_gap)
     return lines
+
+
+def _close_interface_mask(good: np.ndarray, close_px: int) -> np.ndarray:
+    """Close pinhole gaps and fill small interior holes in the interface mask.
+
+    ``binary_closing`` (dilate-then-erode) with a ``disk(close_px)`` structuring
+    element fills gaps up to ~``close_px`` px while returning the OUTER boundary to
+    place (it does not push the land/water boundary seaward), and
+    ``remove_small_holes`` fills fully-enclosed background specks up to the
+    structuring element's area. Isolated ``other``/no-data/whitewater speckles along
+    the waterline are filled so they don't fragment the contour, while a wide no-data
+    stripe or a real vegetation strip wider than the element stays OPEN (so genuine
+    gaps still split). ``close_px = 0`` returns the mask unchanged.
+    """
+    m = np.asarray(good, dtype=bool)
+    if close_px <= 0:
+        return m
+    m = morphology.binary_closing(m, morphology.disk(int(close_px)))
+    area = int((2 * close_px + 1) ** 2) + 1  # only holes up to ~ the element footprint
+    m = morphology.remove_small_holes(m, area_threshold=area)
+    return m
+
+
+def _merge_near_colinear(
+    lines: List[LineString], gap_m: float, angle_tol_deg: float = 25.0
+) -> List[LineString]:
+    """Greedily join contour pieces split by a tiny, near-colinear gap.
+
+    Two ``LineString`` endpoints within ``gap_m`` are joined only when the join is
+    colinear-ish — both lines' end tangents align with the connecting segment within
+    ``angle_tol_deg`` — so pieces split by a pinhole gap on the SAME shoreline are
+    stitched while a real separation (a channel mouth, where the tangents are not
+    aligned with the cross-gap direction, or any gap wider than ``gap_m``) is left
+    open. Existing vertices are never moved; only a short bridging segment is added.
+    """
+    segs: List[Optional[List[Tuple[float, float]]]] = [
+        list(ln.coords) for ln in lines if ln is not None and len(ln.coords) >= 2
+    ]
+    if len(segs) < 2:
+        return [LineString(s) for s in segs if s is not None]
+    cos_tol = math.cos(math.radians(angle_tol_deg))
+
+    def _unit(ax, ay, bx, by):
+        dx, dy = bx - ax, by - ay
+        n = math.hypot(dx, dy)
+        return (dx / n, dy / n) if n > 0 else None
+
+    def _out_tan(seg, end):  # outward unit tangent at an endpoint (end 0=head,1=tail)
+        return _unit(*seg[1], *seg[0]) if end == 0 else _unit(*seg[-2], *seg[-1])
+
+    def _in_tan(seg, end):   # unit tangent pointing INTO the segment from an endpoint
+        return _unit(*seg[0], *seg[1]) if end == 0 else _unit(*seg[-1], *seg[-2])
+
+    def _endpt(seg, end):
+        return seg[0] if end == 0 else seg[-1]
+
+    def _colinear(sa, ea, sb, eb):
+        pa, pb = _endpt(sa, ea), _endpt(sb, eb)
+        d = _unit(*pa, *pb)
+        ta, tb = _out_tan(sa, ea), _in_tan(sb, eb)
+        if d is None or ta is None or tb is None:
+            return False
+        return (ta[0] * d[0] + ta[1] * d[1] >= cos_tol
+                and d[0] * tb[0] + d[1] * tb[1] >= cos_tol)
+
+    def _concat(sa, ea, sb, eb):
+        base = sa[::-1] if ea == 0 else sa           # connecting end -> tail
+        tail = sb if eb == 0 else sb[::-1]           # connecting end -> head
+        return base + tail
+
+    changed = True
+    while changed and sum(s is not None for s in segs) > 1:
+        changed = False
+        pts: List[Tuple[float, float]] = []
+        meta: List[Tuple[int, int]] = []
+        for i, s in enumerate(segs):
+            if s is None:
+                continue
+            pts.append(s[0]); meta.append((i, 0))
+            pts.append(s[-1]); meta.append((i, 1))
+        tree = cKDTree(np.asarray(pts))
+        best = None  # (gap_dist, ia, ea, ib, eb)
+        for a, b in tree.query_pairs(r=gap_m):
+            ia, ea = meta[a]; ib, eb = meta[b]
+            if ia == ib or segs[ia] is None or segs[ib] is None:
+                continue
+            if not _colinear(segs[ia], ea, segs[ib], eb):
+                continue
+            d = math.dist(pts[a], pts[b])
+            if best is None or d < best[0]:
+                best = (d, ia, ea, ib, eb)
+        if best is not None:
+            _, ia, ea, ib, eb = best
+            segs[ia] = _concat(segs[ia], ea, segs[ib], eb)
+            segs[ib] = None
+            changed = True
+    return [LineString(s) for s in segs if s is not None]
 
 
 def _bridge_short_false(ok: np.ndarray, tol: int = 1) -> np.ndarray:
