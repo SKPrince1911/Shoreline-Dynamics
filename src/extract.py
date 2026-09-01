@@ -746,6 +746,23 @@ def _parse_utc(text: str) -> pd.Timestamp:
     return ts
 
 
+def _parse_utc_series(values) -> "pd.Series":
+    """Vectorised robust parse of ISO ``acq_datetime_utc`` strings to tz-aware UTC.
+
+    ``acq_datetime_utc``/``source_acq_datetime_utc`` mix microsecond and
+    no-microsecond forms (``...:32+00:00`` and ``...:32.000000+00:00``). A plain
+    ``pd.to_datetime`` infers ONE format from the first value and then raises on any
+    that differ (e.g. ``"...doesn't match format '%Y-%m-%dT%H:%M:%S.%f%z'"``).
+    ``format="ISO8601"`` (pandas >=2) parses each value independently; ``"mixed"`` is
+    the fallback for older pandas. Use this for any vectorised parse of these fields
+    (Phase 3 tidal-prep included) to avoid that crash.
+    """
+    try:
+        return pd.to_datetime(values, utc=True, format="ISO8601")
+    except (ValueError, TypeError):
+        return pd.to_datetime(values, utc=True, format="mixed")
+
+
 # ===========================================================================
 # 2.2  Imagery
 # ===========================================================================
@@ -3800,7 +3817,7 @@ def intersensor_bias(
     if transects is None:
         transects = load_transects()
     g = gdf.copy()
-    g["_t"] = pd.to_datetime(g["acq_datetime_utc"], utc=True)
+    g["_t"] = _parse_utc_series(g["acq_datetime_utc"])
     pairs: Dict[Tuple[str, str], List[float]] = {}
     pair_counts: Dict[Tuple[str, str], int] = {}
     multi_counts: Dict[Tuple[str, str], int] = {}
