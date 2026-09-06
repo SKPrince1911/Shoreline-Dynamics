@@ -1,0 +1,2 @@
+sensor_a,sensor_b,mean_offset_m,std_offset_m,median_offset_m,n_pairs,n_transect_samples,n_multi_excluded
+L5,L7,-67.28536593882964,50.93727426839155,-59.23921525436657,1,853,0

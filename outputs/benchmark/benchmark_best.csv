@@ -1,0 +1,4 @@
+sensor_group,water_index,threshold_method,classifier,rmse_m,bias_m,mae_m,n,n_multi_excluded
+MSI,mndwi,otsu,local,7.113616530297165,-2.2763013461235655,5.245216309874832,73,69
+OLI,mndwi,otsu,local,9.25350381011063,-5.055854060233309,7.223803716566516,71,106
+TM,mndwi,weighted_peaks,local,11.121056603564549,-1.3848173242663195,8.752914922969074,296,245
