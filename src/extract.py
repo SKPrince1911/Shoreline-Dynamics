@@ -3337,6 +3337,138 @@ def _append_log(path: str, image_id: str, status: str, reason: str) -> None:
                          datetime.now(timezone.utc).isoformat()])
 
 
+def reattempt_missing(
+    missing_df: pd.DataFrame,
+    settings: dict,
+    classifiers: Optional[Dict[str, Pipeline]] = None,
+    version: Optional[str] = None,
+) -> Tuple["gpd.GeoDataFrame", pd.DataFrame]:
+    """Re-run extraction on a small set of scenes and classify each disposition
+    from the IN-MEMORY record (not the GeoJSON, which drops null geometry).
+
+    Mirrors the inner loop of :func:`extract_all` (``load_classifier`` ->
+    ``fetch_scene`` -> :func:`_attach_row_metadata` -> :func:`extract_shoreline`)
+    but instead of checkpointing, inspects each returned record:
+
+    * record geometry is not ``None``            -> status ``'extracted'``
+    * record geometry is ``None`` (no_shoreline) -> status ``'no_shoreline'``
+    * ``Exception``                              -> status ``'error'``, reason=repr
+
+    A scene that extracts no shoreline writes NO feature to the checkpoint
+    (``_write_checkpoint`` filters null geometry, and ``to_file`` would drop it
+    anyway), so the written file cannot distinguish "no shoreline" from "errored".
+    Judging from the record dict — the same ``geometry`` field
+    :func:`_records_to_gdf` uses — is what makes that distinction recoverable.
+
+    Returns:
+        ``(recovered_gdf, disposition_df)`` — ``recovered_gdf`` is a
+        ``GeoDataFrame`` (via :func:`_records_to_gdf`) of ONLY the geometry-bearing
+        records recovered here (to append to the main B file); ``disposition_df`` is
+        a ``DataFrame[image_id, status, reason]`` for EVERY attempted row. Nothing is
+        written or pushed — the caller decides.
+    """
+    clf_cache: Dict[str, Pipeline] = dict(classifiers or {})
+    records: List[dict] = []
+    dispositions: List[dict] = []
+    n_total = len(missing_df)
+    for i, (_, row) in enumerate(missing_df.iterrows(), start=1):
+        image_id = str(row["image_id"])
+        group = sensor_group(str(row["sensor"]))
+        scene = None
+        try:
+            if group not in clf_cache:
+                clf_cache[group] = load_classifier(group, version)
+            scene = fetch_scene(row, tile_px=DEFAULT_TILE_PX)
+            scene = _attach_row_metadata(scene, row)
+            record = extract_shoreline(scene, clf_cache[group], settings)
+            if record.get("geometry") is not None:
+                records.append(record)
+                status, reason = "extracted", ""
+            else:
+                status, reason = "no_shoreline", "extraction returned null geometry"
+            print(f"[{i}/{n_total}] {image_id[:32]}: {status}", flush=True)
+        except Exception as exc:  # keep going; a bad scene must not abort the loop
+            status, reason = "error", repr(exc)
+            print(f"[{i}/{n_total}] {image_id[:32]}: error {reason[:80]}", flush=True)
+        finally:
+            # Release the scene's pixel arrays even on failure (no cross-iteration leak).
+            if scene is not None:
+                del scene
+            gc.collect()
+        dispositions.append(
+            {"image_id": image_id, "status": status, "reason": reason}
+        )
+    return (_records_to_gdf(records),
+            pd.DataFrame(dispositions, columns=["image_id", "status", "reason"]))
+
+
+def reconcile_dense_extraction(
+    scene_list: pd.DataFrame,
+    scenes_gdf: "gpd.GeoDataFrame",
+    disposition_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Build a one-row-per-queried-scene audit table for Series B (pure join, no GEE).
+
+    For each ``image_id`` in ``scene_list``:
+
+    * present in ``scenes_gdf``   -> status ``'extracted'``, carrying ``length_m``,
+      ``pct_aoi_alongshore_covered`` and ``flags`` from ``scenes_gdf``;
+    * else in ``disposition_df``  -> that row's ``status``/``reason``;
+    * else                        -> ``'unaccounted'`` (should not occur once the
+      disposition covers every scene absent from the file).
+
+    This is the audit trail the written GeoJSON cannot provide: a scene that yielded
+    no shoreline has null geometry and is dropped by ``to_file``, so it is invisible
+    in ``sds_scenes_B.geojson`` and indistinguishable there from one that errored.
+
+    Returns:
+        A ``DataFrame`` with columns ``[image_id, sensor, acq_datetime_utc,
+        season_complete, aoi_cloud_pct, aoi_coverage_pct, status, reason, length_m,
+        pct_aoi_alongshore_covered, flags]`` sorted by ``acq_datetime_utc``. Pure
+        pandas; no side effects.
+    """
+    carry = ("length_m", "pct_aoi_alongshore_covered", "flags")
+    by_id: Dict[str, dict] = {}
+    if scenes_gdf is not None and len(scenes_gdf) and "image_id" in scenes_gdf.columns:
+        for _, r in scenes_gdf.iterrows():
+            by_id[str(r["image_id"])] = {c: r.get(c) for c in carry}
+    disp: Dict[str, dict] = {}
+    if disposition_df is not None and len(disposition_df):
+        for _, r in disposition_df.iterrows():
+            disp[str(r["image_id"])] = {"status": r.get("status"),
+                                        "reason": r.get("reason")}
+
+    meta = ("sensor", "acq_datetime_utc", "season_complete",
+            "aoi_cloud_pct", "aoi_coverage_pct")
+    rows: List[dict] = []
+    for _, r in scene_list.iterrows():
+        image_id = str(r["image_id"])
+        row = {"image_id": image_id}
+        row.update({c: r.get(c) for c in meta})
+        hit = by_id.get(image_id)
+        if hit is not None:
+            row.update({"status": "extracted", "reason": ""})
+            row.update(hit)
+        else:
+            d = disp.get(image_id)
+            if d is not None:
+                row.update({"status": d.get("status"), "reason": d.get("reason")})
+            else:
+                row.update({"status": "unaccounted",
+                            "reason": "absent from both the B file and the disposition"})
+            row.update({c: None for c in carry})
+        rows.append(row)
+
+    cols = ["image_id", *meta, "status", "reason", *carry]
+    out = pd.DataFrame(rows, columns=cols)
+    if len(out) and "acq_datetime_utc" in out.columns:
+        # Robust ISO parse (mixed microsecond/no-microsecond forms) for the sort only.
+        out = (out.assign(_t=_parse_utc_series(out["acq_datetime_utc"]))
+                  .sort_values("_t", kind="stable")
+                  .drop(columns="_t"))
+    return out.reset_index(drop=True)
+
+
 def merge_annual(gdf: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame":
     """Assemble the Series A merged file Phase 3 consumes (D1/§3).
 
