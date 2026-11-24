@@ -4,8 +4,8 @@
 Q1-publishable, fully reproducible pipeline for satellite-derived shoreline
 (SDS) change and driver attribution along the ~92 km sandy/deltaic Cox's
 Bazar–Teknaf coast (Bay of Bengal). Meso-tidal (~3 m spring range), monsoon-
-dominated, cyclone-affected. Target period: 1985–2025 (dry-season-years
-1984-1985 … 2024-2025).
+dominated, cyclone-affected. Inventory period: 1985–2025 (dry-season-years
+1984-1985 … 2024-2025); REPORTED study period 1988–2025 (D7).
 
 ## Execution model (IMPORTANT)
 - Claude Code (web) only WRITES/edits code in this repo.
@@ -37,15 +37,19 @@ dominated, cyclone-affected. Target period: 1985–2025 (dry-season-years
   dry-season-year with a realistic chance of complete coverage using identical
   MNDWI/sub-pixel logic; earlier years are expected to be sparse.
 - Masking: Cloud Score+ for S2 (cs ~0.55); QA_PIXEL/CFMask for Landsat.
-- Composites: dry-season (Nov–Mar) annual medians for the trend layer; single
-  tidally-corrected images for cyclone/monsoon event analysis.
+- Composites: SUPERSEDED (2026-07). Median composites were REJECTED for the
+  trend layer; Series A uses single scenes or a provenance-tracked greedy
+  fill-mosaic, and each contributing scene is extracted separately (D1) so it
+  keeps its own acquisition time for tidal correction.
 - Extraction: per-SCENE (D1) supervised LOCAL sand/water/whitewater/other
   classifier (D3) + marching-squares sub-pixel contour on the water-index
   interface (CoastSat/CoastSeg family); the water index is a benchmarked
   PARAMETER, default MNDWI (D4). NOT reduceToVectors / pixel thresholding.
   See "## Phase 2 — sub-pixel shoreline extraction (locked: D1–D7)" below,
   which supersedes this line where they differ.
-- Tidal correction: FES2022 via pyTMD/pyfes; slope via CoastSat.slope
+- Tidal correction: tide model via pyTMD — FES2022b, EOT20 and TPXO compared
+  against BIWTA Cox's Bazar gauge data; the best-validated model is used and
+  its RMSE enters the uncertainty budget (decision 2026-11-25); slope via CoastSat.slope
   (Lomb-Scargle). Horizontal shift X = (Z_tide - Z_MSL) / tan(beta).
 - Uncertainty: root-sum-of-squares per-shoreline budget (pixel, georef, tidal,
   seasonal, digitizing) -> EPR_unc = sqrt(U1^2 + U2^2)/T; WLR weights = 1/U^2.
@@ -97,9 +101,22 @@ Phase 1 inventory (18 single / 19 composite / 1 partial / 3 gap).
   constant `config.GEOREF_RMSE_DEFAULT_M['S2']` (~11 m). Hence E_georef is a
   per-scene MEASUREMENT for Landsat but a fixed ASSUMPTION for Sentinel-2, and
   Phase 4 must state the S2 term as an assumption, not a measurement.
-- **D6 — inter-sensor bias quantification is a Phase 2 deliverable** (e.g. at
-  sensor-overlap dates on pixel-aligned grids), so cross-sensor offsets are
-  characterised before rates are computed.
+- **D6 — inter-sensor bias quantification — DEFERRED TO PHASE 3** (decision
+  2026-09). The raw Phase 2 value (L5↔L7 mean −67.3 m, from a single scene
+  pair) is tide-contaminated and must NOT be used. Bias is recomputed only
+  AFTER co-registration and water-level correction, from near-same-day overlap
+  pairs (L5–L7, L7–L8, L8/L9–S2), reporting the pair count with each value.
+- **Locked extraction configuration (benchmark result, 2026-09).**
+  `WATER_INDEX_DEFAULT = "mndwi"`; `THRESHOLD_METHOD_BY_GROUP =
+  {"MSI": "otsu", "OLI": "otsu", "TM": "weighted_peaks"}`; local MLP
+  classifier per sensor group. Benchmark (25 manual instantaneous-waterline
+  references): RMSE MSI 7.1 m, OLI 9.3 m, TM 11.1 m (TM without classifier
+  69.9 m). SCoWI and pansharpening were NOT benchmarked
+  (`SCOWI_VERIFIED=False`, `PANSHARPEN=False`). These RMSEs are
+  waterline-delineation errors against image-digitised lines, not
+  ground-truth shoreline-position errors. Note: 3 of the 5 reference scenes
+  (L5 2006, L9 2022, S2 2023) are also training scenes — report RMSE split by
+  training vs independent scene (see SCOPE.md).
 - **D7 — reported study period is 1988–2025 (38 dry-season-years).**
   1985–87 is a Landsat archive gap (no usable imagery over the AOI). 1991
   remains `partial` and carries an INFLATED uncertainty flag.
@@ -122,8 +139,10 @@ the code that consumes them:
   extraction to the coast (suppresses false detections inland and offshore).
 - `data/training_polygons.geojson` — labelled polygons, `class ∈ {other, sand,
   whitewater, water}`, per D3's three sensor groups.
-- `data/reference_shorelines/` — 10 manually digitised validation shorelines
-  for the D4 water-index/threshold benchmark.
+- `data/reference_shorelines/reference_lines_manual.geojson` — 25 manually
+  digitised INSTANTANEOUS-WATERLINE reference lines (5 each from L5 1989,
+  L5 2006, L5 2009, L9 2022, S2 2023) for the D4 benchmark. (Originally
+  planned as 10 wet/dry lines; superseded.)
 - `data/baseline.geojson` — a single smooth LineString landward of and roughly
   parallel to the coast; `extract.build_transects()` casts shore-normal DSAS
   transects from it (default 50 m spacing, 1500 m long) to
@@ -132,7 +151,7 @@ the code that consumes them:
 ## Temporal design (locked)
 - Annual shoreline is derived from the DRY SEASON ONLY (Nov–Mar); monsoon
   months are excluded from the trend layer. This annual layer is Series A (D2);
-  Phase 2 additionally builds Series B — a dense, all-season 1999–2025 series
+  Phase 2 additionally builds Series B — a dense, all-season 1999-01-01..2026-04-30 series
   needed for tidal-slope estimation (see D2 below).
 - One BEST (clearest) image per dry-season-year — a single scene, not a
   composite — is selected for the annual shoreline. (This is the Phase 1
@@ -193,3 +212,27 @@ the code that consumes them:
 - Work ONE phase at a time. After each change, tell the user exactly how to
   verify it in Colab before moving on. Explain what changed and why.
 - Never delete verified working code or break reproducibility.
+
+## Current status (updated 2026-11-25)
+- Phase 1 image inventory — DONE (41 rows: 18 single / 19 composite /
+  1 partial (1991) / 3 none (1985–87)).
+- Phase 2 extraction — DONE. Series A: 60 scenes, 38 dry-years
+  (`outputs/shorelines/sds_scenes.geojson`, `sds_annual_merged.geojson`).
+  Series B: 871 queried → 839 shorelines / 30 no-shoreline / 2 error
+  (`outputs/shorelines/sds_scenes_B*.{geojson,csv}`).
+- Phase 3 (co-registration + tide/slope/setup correction) — NOT STARTED
+  (`src/tides.py` is a stub). This is the next step.
+- Phases 4–5 (`src/change.py`, `src/drivers.py`) — stubs, not started.
+- `outputs/shorelines/` is the authoritative location for shoreline outputs.
+  The hand-uploaded duplicates once at the `outputs/` root were moved to
+  `outputs/archive/` (2026-11-25) and are not read by any code.
+- Paper scope, research questions and milestones: see `SCOPE.md`.
+
+## Decision log
+Record every methodological change here with its date, newest first.
+- 2026-11-25 — Scope locked to two papers (SCOPE.md). Phase 3 order:
+  co-registration → outlier removal → water level (tide model chosen by
+  tide-gauge validation among FES2022b / EOT20 / TPXO; ± wave setup) →
+  CoastSat.slope per segment → translate to MSL → inter-sensor bias.
+- 2026-09 — D6 deferred to Phase 3; extraction config locked per sensor group.
+- 2026-07 — Median composites rejected; provenance-tracked fill-mosaic adopted.
