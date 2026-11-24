@@ -14,7 +14,8 @@ All code runs in Google Colab with Google Earth Engine; heavy logic lives in
 |---|---|---|
 | 1 Image inventory | `src/data.py`, `notebooks/02_image_inventory.ipynb` | Done |
 | 2 Sub-pixel extraction (Series A + B), benchmark | `src/extract.py`, `notebooks/03a_*`, `03b_*` | Done |
-| 3 Co-registration, tide / beach-slope / setup correction | `src/tides.py` | **Not started (stub)** |
+| 3a Co-registration | `src/coreg.py`, `notebooks/05_coregistration.ipynb` | Code ready, run pending |
+| 3b Tide / beach-slope / setup correction | `src/tides.py` | Not started (stub) |
 | 4 Change rates + uncertainty | `src/change.py` | Not started (stub) |
 | 5 Driver attribution | `src/drivers.py` | Not started (stub) |
 
