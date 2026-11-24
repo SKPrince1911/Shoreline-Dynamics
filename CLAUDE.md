@@ -24,7 +24,8 @@ dominated, cyclone-affected. Inventory period: 1985–2025 (dry-season-years
 - src/config.py  : AOI, CRS, date ranges, constants (single source of truth)
 - src/data.py    : image retrieval + quality/cloud masking      (Phase 1)
 - src/extract.py : sub-pixel shoreline extraction               (Phase 2)
-- src/tides.py   : FES2022 tidal + beach-slope correction       (Phase 3)
+- src/coreg.py   : image co-registration to one S2 reference     (Phase 3a)
+- src/tides.py   : tide-model + beach-slope (+ setup) correction  (Phase 3b)
 - src/change.py  : transects, NSM/EPR/LRR/WLR/LMS, uncertainty  (Phase 4)
 - src/drivers.py : wave/cyclone/SLR/sediment attribution        (Phase 5)
 
@@ -230,6 +231,12 @@ the code that consumes them:
 
 ## Decision log
 Record every methodological change here with its date, newest first.
+- 2026-11-25 — Phase 3a co-registration (src/coreg.py, notebooks/05): translation-only
+  per scene vs ONE automatically chosen clear dry-season S2 reference (2022–2026);
+  62 land chips (1.92 km, two rows 1.5/3.5 km inland of baseline); NIR, invalid and
+  water (MNDWI>0) masked; upsampled cross-correlation (1/100 px) with one refinement;
+  chip gates |shift|≤90 m, r≥0.5, ≥80% usable; scene = median after 3·MAD, ≥6 chips
+  for 'ok'. Shifts applied to shoreline VECTORS (sds_scenes*_coreg.geojson); originals kept.
 - 2026-11-25 — Scope locked to two papers (SCOPE.md). Phase 3 order:
   co-registration → outlier removal → water level (tide model chosen by
   tide-gauge validation among FES2022b / EOT20 / TPXO; ± wave setup) →
